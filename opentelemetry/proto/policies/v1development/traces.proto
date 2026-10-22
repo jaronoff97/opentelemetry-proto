@@ -24,6 +24,87 @@ option java_package = "io.opentelemetry.proto.policies.v1development";
 option java_outer_classname = "PoliciesTracesProto";
 option go_package = "go.opentelemetry.io/proto/otlp/policies/v1development";
 
+// TraceEnablementPolicy enables span generation and opt-in span attributes for
+// matching instrumentation scopes that are disabled by default.
+//
+// A scope that no enablement policy matches retains its default enablement
+// state.
+//
+// Status: [Development]
+//
+// [Since next]
+message TraceEnablementPolicy {
+  // Conditions that an instrumentation scope MUST satisfy to be enabled.
+  //
+  // A consumer combines the matchers with AND: every matcher MUST report true
+  // before the scope is enabled. A policy MUST carry at least one matcher.
+  //
+  // [Since next]
+  repeated TraceEnablementMatcher matches = 1;
+
+  // Optional attribute keys or glob patterns to enable on matching spans.
+  //
+  // Each entry is a case-sensitive attribute key or glob pattern ('*' matches
+  // zero or more characters; '?' matches any single character). When empty,
+  // matching scopes use their default enabled attribute set. When non-empty,
+  // attributes matching any entry across matching enablement policies are
+  // enabled alongside the default enabled attribute set.
+  //
+  // [Since next]
+  repeated string include_attributes = 2;
+}
+
+// TraceEnablementMatcher evaluates one predicate against one pre-creation
+// trace scope target.
+//
+// Status: [Development]
+//
+// [Since next]
+message TraceEnablementMatcher {
+  // The attribute or scope metadata to inspect.
+  //
+  // [Since next]
+  TraceEnablementFieldSelector target = 1;
+
+  // How to compare the value that target selects.
+  //
+  // [Since next]
+  Predicate predicate = 2;
+
+  // Inverts the result of the predicate.
+  //
+  // [Since next]
+  bool negate = 3;
+}
+
+// TraceEnablementFieldSelector names one pre-creation trace scope target.
+// Exactly one variant MUST be set.
+//
+// Status: [Development]
+//
+// [Since next]
+message TraceEnablementFieldSelector {
+  // The target. Exactly one variant MUST be set.
+  //
+  // [Since next]
+  oneof target {
+    // A resource attribute, for example ["service.name"].
+    //
+    // [Since next]
+    AttributePath resource_attribute = 1;
+
+    // An instrumentation scope attribute.
+    //
+    // [Since next]
+    AttributePath scope_attribute = 2;
+
+    // A first-class field of the instrumentation scope.
+    //
+    // [Since next]
+    ScopeField scope_field = 3;
+  }
+}
+
 // TraceSamplingPolicy samples a span by probability.
 //
 // The policy follows the OpenTelemetry probability sampling specification. A

@@ -24,6 +24,121 @@ option java_package = "io.opentelemetry.proto.policies.v1development";
 option java_outer_classname = "PoliciesLogsProto";
 option go_package = "go.opentelemetry.io/proto/otlp/policies/v1development";
 
+// LogEnablementPolicy enables log record generation and opt-in log attributes
+// for matching instrumentation scopes, severity levels, or events that are
+// disabled by default.
+//
+// Telemetry that no enablement policy matches retains its default enablement
+// state.
+//
+// Status: [Development]
+//
+// [Since next]
+message LogEnablementPolicy {
+  // Conditions that a log scope or pre-creation log record MUST satisfy to be
+  // enabled.
+  //
+  // A consumer combines the matchers with AND: every matcher MUST report true
+  // before the matching telemetry is enabled. A policy MUST carry at least one
+  // matcher.
+  //
+  // [Since next]
+  repeated LogEnablementMatcher matches = 1;
+
+  // Optional attribute keys or glob patterns to enable on matching log
+  // records.
+  //
+  // Each entry is a case-sensitive attribute key or glob pattern ('*' matches
+  // zero or more characters; '?' matches any single character). When empty,
+  // matching log records use their default enabled attribute set. When
+  // non-empty, attributes matching any entry across matching enablement
+  // policies are enabled alongside the default enabled attribute set.
+  //
+  // [Since next]
+  repeated string include_attributes = 2;
+}
+
+// LogEnablementMatcher evaluates one predicate against one pre-creation log
+// target.
+//
+// Status: [Development]
+//
+// [Since next]
+message LogEnablementMatcher {
+  // The pre-creation record field, attribute, or scope metadata to inspect.
+  //
+  // [Since next]
+  LogEnablementFieldSelector target = 1;
+
+  // How to compare the value that target selects.
+  //
+  // [Since next]
+  Predicate predicate = 2;
+
+  // Inverts the result of the predicate.
+  //
+  // [Since next]
+  bool negate = 3;
+}
+
+// LogEnablementFieldSelector names one pre-creation log target. Exactly one
+// variant MUST be set.
+//
+// Status: [Development]
+//
+// [Since next]
+message LogEnablementFieldSelector {
+  // The target. Exactly one variant MUST be set.
+  //
+  // [Since next]
+  oneof target {
+    // A pre-creation field of a log record.
+    //
+    // [Since next]
+    LogEnablementRecordField record_field = 1;
+
+    // A resource attribute, for example ["service.name"].
+    //
+    // [Since next]
+    AttributePath resource_attribute = 2;
+
+    // An instrumentation scope attribute.
+    //
+    // [Since next]
+    AttributePath scope_attribute = 3;
+
+    // A first-class field of the instrumentation scope.
+    //
+    // [Since next]
+    ScopeField scope_field = 4;
+  }
+}
+
+// LogEnablementRecordField identifies a pre-creation field of a log record.
+//
+// Status: [Development]
+//
+// [Since next]
+enum LogEnablementRecordField {
+  // The field is not set. A selector with an unset field is invalid.
+  //
+  // [Since next]
+  LOG_ENABLEMENT_RECORD_FIELD_UNSPECIFIED = 0;
+
+  // The severity of the log record as a number from 1 to 24.
+  //
+  // The equals predicate and the comparison predicates read the number. The
+  // regex predicate reads the canonical base-10 text, for example "17".
+  //
+  // [Since next]
+  LOG_ENABLEMENT_RECORD_FIELD_SEVERITY_NUMBER = 1;
+
+  // The event name of the log record.
+  //
+  // [Since next]
+  LOG_ENABLEMENT_RECORD_FIELD_EVENT_NAME = 2;
+}
+
 // LogFilterPolicy keeps or drops a log record.
 //
 // A consumer evaluates each log record on its own. A log record that no filter
