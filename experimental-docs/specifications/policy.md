@@ -49,7 +49,6 @@
 - [YAML Representation](#yaml-representation)
 - [Conformance](#conformance)
 - [Implementation Notes](#implementation-notes)
-  - [Choosing a Regular Expression Engine](#choosing-a-regular-expression-engine)
   - [Identifier Comparison](#identifier-comparison)
 - [Design Decisions and Tradeoffs](#design-decisions-and-tradeoffs)
   - [One atomic policy type per intent](#one-atomic-policy-type-per-intent)
@@ -62,7 +61,6 @@
   - [The target never carries the expected value](#the-target-never-carries-the-expected-value)
   - [`exists` is `google.protobuf.Empty`](#exists-is-googleprotobufempty)
   - [A small predicate set](#a-small-predicate-set)
-  - [`regex` is an unanchored partial match](#regex-is-an-unanchored-partial-match)
   - [Identifier fields are matched as hexadecimal text](#identifier-fields-are-matched-as-hexadecimal-text)
   - [`contains` is typed and covers arrays](#contains-is-typed-and-covers-arrays)
   - [An attribute path](#an-attribute-path)
@@ -175,13 +173,13 @@ target never carries an expected value, and a predicate never names a field:
 ```
 
 Because the value lives in the predicate, every predicate works against every
-target. The same `SPAN_RECORD_FIELD_KIND` target accepts a different comparison
-without a schema change:
+target. The same `SPAN_RECORD_FIELD_NAME` target accepts an exact match or a
+wildcard comparison without a schema change:
 
 ```yaml
-# Match a server span or a consumer span.
-- target: { record_field: SPAN_RECORD_FIELD_KIND }
-  predicate: { regex: "^(SERVER|CONSUMER)$" }
+# Match any v1 API span name.
+- target: { record_field: SPAN_RECORD_FIELD_NAME }
+  predicate: { glob: "GET /api/v1/*" }
 ```
 
 A design that put the value in the target, such as `span_kind: SERVER`, would
@@ -246,7 +244,7 @@ A matcher MUST set exactly one predicate.
 | ---------- | -------------- | ----------------------------------------------------- |
 | `exists`   | `Empty`        | The target is present.                                |
 | `equals`   | `ScalarValue`  | The target value equals the scalar.                   |
-| `regex`    | string         | The target string value satisfies the RE2 expression. |
+| `glob`     | string         | The target string value satisfies the glob pattern.   |
 | `gt`       | `NumericValue` | The target number is greater than the argument.       |
 | `gte`      | `NumericValue` | The target number is greater than or equal to it.     |
 | `lt`       | `NumericValue` | The target number is less than the argument.          |
@@ -260,27 +258,18 @@ field that carries no presence information in the OpenTelemetry data model, the
 target is present when the field holds a non-default value. To test for absence,
 pair `exists` with `negate: true`.
 
-#### **`regex`**
+#### **`glob`**
 
-A consumer MUST use [RE2 syntax](https://github.com/google/re2/wiki/Syntax). The
-expression is an **unanchored partial match**, as Go `regexp.MatchString` and
-OTTL `IsMatch` define it. To require a full match, supply the anchors `^` and
-`$`. To match without regard to case, supply the flag `(?i)`. The predicate
-applies only to a string target value.
+`glob` matches when the target string value satisfies the wildcard pattern.
+Matching is a case-sensitive full-string match where:
 
-Without the flag `(?m)`, `^` matches only at the start of the target value, and
-`$` matches only at its end. `$` MUST NOT match before a trailing newline. This
-rule is normative because the PCRE family and the RE2 family disagree on it by
-default: `^ERROR$` MUST reject the value `"ERROR\n"`.
+- `*` matches any number of characters, including none.
+- `?` matches any single character.
+- Every other character matches only itself.
 
-A consumer MUST reject a pattern that RE2 syntax does not accept, such as a
-backreference or a lookaround assertion. This rule keeps a policy portable, and
-it keeps evaluation linear in the length of the target value, so a policy author
-cannot push an expression that exhausts the consumer.
-
-The engine is not fixed. A consumer MAY use any regular expression engine whose
-accepted language covers RE2 syntax and whose results agree with the rules
-above. See [Implementation Notes](#implementation-notes).
+The predicate applies only to a string target value. This matches the wildcard
+syntax used by `IncludeExclude` in
+[OpenTelemetry Declarative Configuration](https://github.com/open-telemetry/opentelemetry-configuration/blob/main/schema/common.yaml).
 
 #### **`contains`**
 
@@ -402,7 +391,7 @@ When `body_field` is selected and `LogRecord.body` is not a `KeyValueList` map
 | ---------------------------------- | ---------------------------------------------------------------- |
 | `LOG_RECORD_FIELD_BODY`            | The body.                                                        |
 | `LOG_RECORD_FIELD_SEVERITY_TEXT`   | Text, for example `"INFO"`.                                      |
-| `LOG_RECORD_FIELD_SEVERITY_NUMBER` | A number from 1 to 24. `regex` reads the canonical base-10 text. |
+| `LOG_RECORD_FIELD_SEVERITY_NUMBER` | A number from 1 to 24.                                           |
 | `LOG_RECORD_FIELD_TRACE_ID`        | 32-character lowercase hexadecimal text.                         |
 | `LOG_RECORD_FIELD_SPAN_ID`         | 16-character lowercase hexadecimal text.                         |
 | `LOG_RECORD_FIELD_EVENT_NAME`      | The event name.                                                  |
@@ -523,9 +512,15 @@ string `replacement` on string record fields (`LOG_RECORD_FIELD_SEVERITY_TEXT`,
 (`LOG_RECORD_FIELD_SEVERITY_NUMBER`, `LOG_RECORD_FIELD_TRACE_ID`,
 `LOG_RECORD_FIELD_SPAN_ID`) yields no change.
 
-When `regex` is set, the consumer evaluates the RE2 expression against the
-current string value of the target:
+When `regex` is set, the consumer evaluates the
+[RE2 expression](https://github.com/google/re2/wiki/Syntax) against the current
+string value of the target:
 
+- A consumer MUST reject a pattern that RE2 syntax does not accept, such as a
+  backreference or a lookaround assertion.
+- Without the flag `(?m)`, `^` matches only at the start of the target value,
+  and `$` matches only at its end (`$` MUST NOT match before a trailing
+  newline).
 - An expression that does not match yields no change.
 - An expression that matches replaces **every** non-overlapping full match, not
   only the first one.
@@ -592,7 +587,7 @@ the prune leaves empty.
 | `METRIC_DESCRIPTOR_FIELD_UNIT`                    | The unit.                                                                               |
 | `METRIC_DESCRIPTOR_FIELD_TYPE`                    | `"GAUGE"`, `"SUM"`, `"HISTOGRAM"`, `"EXPONENTIAL_HISTOGRAM"`, or `"SUMMARY"`.           |
 | `METRIC_DESCRIPTOR_FIELD_AGGREGATION_TEMPORALITY` | `"DELTA"` or `"CUMULATIVE"`. A type that carries no temporality does not match.         |
-| `METRIC_DESCRIPTOR_FIELD_IS_MONOTONIC`            | A boolean. `regex` reads `"true"` or `"false"`. A type other than a Sum does not match. |
+| `METRIC_DESCRIPTOR_FIELD_IS_MONOTONIC`            | A boolean. A type other than a Sum does not match.                                      |
 
 ## Trace Sampling Policy
 
@@ -837,7 +832,7 @@ telemetry. A policy is invalid when any of these hold:
 | A matcher sets no predicate.                                | an empty `predicate` oneof                 |
 | A selector names an unspecified enum value.                 | `LOG_RECORD_FIELD_UNSPECIFIED`             |
 | An attribute path is empty.                                 | `log_attribute: []`                        |
-| A `regex` predicate or a `redact` pattern is not valid RE2. | `regex: "([a-z"`                           |
+| A `redact` pattern is not valid RE2.                        | `regex: "([a-z"`                           |
 | A typed value is unset.                                     | an empty `ScalarValue`                     |
 | A filter policy has an unset action.                        | `action` absent                            |
 | A sampling configuration is out of range.                   | `percentage: 150`, `sampling_precision: 0` |
@@ -934,7 +929,7 @@ name: Drop histogram metrics
 metric_filter:
   matches:
     - target: { descriptor_field: METRIC_DESCRIPTOR_FIELD_TYPE }
-      predicate: { regex: "^(HISTOGRAM|EXPONENTIAL_HISTOGRAM)$" }
+      predicate: { glob: "*HISTOGRAM" }
   action: ACTION_DROP
 ```
 
@@ -946,7 +941,7 @@ name: Drop health check spans
 trace_sampling:
   matches:
     - target: { span_attribute: { path: ["http.route"] } }
-      predicate: { regex: "^/(healthz|readyz)$" }
+      predicate: { glob: "/health*" }
   sampling:
     percentage: 0.0
 ```
@@ -1006,47 +1001,6 @@ optional, and each counter is optional on its own.
 
 This section is informative. It records guidance that the normative sections
 above imply but do not state, and it does not add a requirement.
-
-### Choosing a Regular Expression Engine
-
-This document names RE2 as the required **syntax**, not as a required library. A
-consumer MAY use any engine that accepts the RE2 grammar and agrees with the
-semantics under [Predicates](#predicates). The two regular expression fields
-place different demands on that engine.
-
-| Field             | Needs                                                                                                    |
-| ----------------- | -------------------------------------------------------------------------------------------------------- |
-| `Predicate.regex` | One boolean answer: does the pattern match anywhere in the value.                                        |
-| `LogRedact.regex` | The range of every non-overlapping match, plus each capture group that the `replacement` template reads. |
-
-A consumer with a large policy set will scan one value against many patterns. A
-multiple-pattern engine, such as
-[Hyperscan](https://intel.github.io/hyperscan/dev-reference/), answers every
-`Predicate.regex` in one pass over the value, where a single-pattern engine
-needs one pass per pattern. That is a sound optimization, within these limits:
-
-- **Captures are unavailable.** Hyperscan parses a capture group and then
-  ignores it. It therefore cannot serve `LogRedact.regex`. A consumer that uses
-  a multiple-pattern engine for the predicate still needs RE2, PCRE2, or an
-  equivalent engine for the redact operation.
-- **Anchors need care.** Hyperscan follows the PCRE rule, under which `$`
-  matches before a trailing newline. A consumer MUST override that behavior to
-  satisfy the normative rule in [Predicates](#predicates).
-- **Unicode is opt-in.** Hyperscan treats a pattern as bytes until the verbs
-  `(*UTF8)` and `(*UCP)` are set. A consumer that accepts a pattern with a
-  Unicode class MUST set them.
-- **Bounded repeats have limits.** A wide bound such as `a{1,60000}` compiles
-  under RE2 and MAY fail to compile under Hyperscan. A consumer MUST treat such
-  a failure as a [compilation error](#compilation-errors) for that one policy,
-  and MUST keep every other policy running.
-- **Lazy quantifiers change nothing.** Hyperscan accepts `*?` and then ignores
-  it. A boolean answer does not depend on greed, so the result still agrees with
-  RE2.
-
-A common arrangement uses a multiple-pattern engine as a prefilter over the
-whole policy set, then evaluates only the patterns that engine reports against a
-single-pattern engine. The prefilter MUST NOT change any outcome. It only avoids
-work.
 
 ### Identifier Comparison
 
@@ -1159,7 +1113,7 @@ selector, read by a normal predicate against their canonical uppercase name.
 `metric_type: HISTOGRAM`, and it trades an enum for a string, so a
 typo is caught at evaluation time rather than at compile time. In exchange the
 predicate set stays universal, a matcher never needs a dummy predicate, and one
-matcher can span several values with `regex: "HISTOGRAM|GAUGE"`. Placing the
+matcher can span several values with `glob: "*HISTOGRAM"`. Placing the
 expected value in the target also makes `negate` and the comparison predicates
 meaningless for those fields, which the chosen form avoids.
 
@@ -1174,27 +1128,16 @@ negative with no agreed meaning, becomes unrepresentable.
 
 ### A small predicate set
 
-**Decision.** The predicate set is `exists`, `equals`, `regex`, `gt`, `gte`,
-`lt`, `lte`, and `contains`. There is no `exact`, no `starts_with`, no
-`ends_with`, and no matcher-level `case_insensitive` flag.
+**Decision.** The predicate set is `exists`, `equals`, `glob`, `gt`, `gte`,
+`lt`, `lte`, and `contains`. There is no `exact`, no `starts_with`, and no
+`ends_with`.
 
-**Tradeoff.** A prefix match now reads `regex: "^/api/"` rather than
-`starts_with: "/api/"`, and a case-insensitive match needs the `(?i)` flag. A
-literal prefix match is also cheaper to evaluate than a regular expression, so a
-consumer that cares loses a fast path unless it recognizes an anchored literal
-pattern. In exchange there are four fewer variants to define, document, and
-test, with no loss of expressiveness. `exact` is dropped entirely because
-`equals` with a `string_value` covers it.
-
-### `regex` is an unanchored partial match
-
-**Decision.** A `regex` predicate is an unanchored partial match, as Go
-`regexp.MatchString` and OTTL `IsMatch` define it.
-
-**Tradeoff.** An author who expects full-string semantics will write a pattern
-that matches more than intended until they add `^` and `$`. Leaving the question
-open was the larger risk: two conformant consumers could otherwise disagree on
-the same policy.
+**Tradeoff.** A prefix match now reads `glob: "/api/*"` rather than
+`starts_with: "/api/"`, and a suffix match reads `glob: "*.json"` rather than
+`ends_with: ".json"`. In exchange there are fewer variants to define, document,
+and test, while prefix and suffix patterns remain trivial for a consumer to
+recognize and optimize. `exact` is dropped entirely because `equals` with a
+`string_value` covers it.
 
 ### Identifier fields are matched as hexadecimal text
 
@@ -1205,7 +1148,7 @@ value variant.
 **Tradeoff.** A consumer that stores an identifier as raw bytes must either
 render it or, as recommended, decode the literal once at compile time. A
 dedicated `hex_value` variant would make the byte comparison explicit on the
-wire. The chosen form gives one representation per field, so `equals`, `regex`,
+wire. The chosen form gives one representation per field, so `equals`, `glob`,
 and `contains` all agree on what an identifier looks like, and an author never
 has to know whether a given field is bytes or a string.
 
