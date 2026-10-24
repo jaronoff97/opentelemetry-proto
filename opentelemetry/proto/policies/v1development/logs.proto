@@ -53,13 +53,14 @@ message LogFilterPolicy {
 
 // LogTransformPolicy modifies a log record that survives the filter stage.
 //
-// A consumer applies the operations in one fixed order: rename, then add,
-// then remove, then redact. Within each operation stage, operations across
-// all matching LogTransformPolicy rules run in ascending lexicographical
-// (UTF-8 byte) order of Policy.id, and in list order within each policy. A
-// consumer MUST NOT reorder the operations.
-//
-// A policy MUST carry at least one operation.
+// Each LogTransformPolicy specifies one transformation action stage (rename,
+// add, remove, or redact), which carries one or more operations of that stage.
+// Across all matching LogTransformPolicy rules, a consumer applies actions in
+// one fixed stage order: rename, then add, then remove, then redact. Within
+// each operation stage, matching LogTransformPolicy rules run in ascending
+// lexicographical (UTF-8 byte) order of Policy.id, and the operations within
+// each policy's action run in list order. A consumer MUST NOT reorder the
+// operations.
 //
 // Status: [Development]
 //
@@ -74,25 +75,32 @@ message LogTransformPolicy {
   // [Since next]
   repeated LogMatcher matches = 1;
 
-  // Fields to rename.
+  // The transformation action stage to perform when matches evaluates to true.
+  // Exactly one variant MUST be set, and its operation list MUST NOT be empty.
   //
   // [Since next]
-  repeated LogRename rename = 2;
+  oneof action {
+    // Renames one or more attributes or structured body fields.
+    //
+    // [Since next]
+    LogRenameAction rename = 2;
 
-  // Fields to insert.
-  //
-  // [Since next]
-  repeated LogAdd add = 3;
+    // Inserts or overwrites one or more fields or attributes.
+    //
+    // [Since next]
+    LogAddAction add = 3;
 
-  // Fields to delete. A field that is absent yields no change.
-  //
-  // [Since next]
-  repeated LogRemove remove = 4;
+    // Deletes one or more fields or attributes. A target that is absent yields
+    // no change.
+    //
+    // [Since next]
+    LogRemoveAction remove = 4;
 
-  // Field values to mask.
-  //
-  // [Since next]
-  repeated LogRedact redact = 5;
+    // Masks one or more field values, or parts of field values.
+    //
+    // [Since next]
+    LogRedactAction redact = 5;
+  }
 }
 
 // LogMatcher evaluates one predicate against one log target.
@@ -216,6 +224,19 @@ message LogAttributeSelector {
   }
 }
 
+// LogRemoveAction holds the ordered list of remove operations for a remove
+// policy. At least one operation MUST be specified.
+//
+// Status: [Development]
+//
+// [Since next]
+message LogRemoveAction {
+  // The remove operations to execute in list order.
+  //
+  // [Since next]
+  repeated LogRemove removals = 1;
+}
+
 // LogRemove deletes one field or attribute from a log record.
 //
 // Status: [Development]
@@ -226,6 +247,19 @@ message LogRemove {
   //
   // [Since next]
   LogTargetSelector target = 1;
+}
+
+// LogRedactAction holds the ordered list of redact operations for a redact
+// policy. At least one operation MUST be specified.
+//
+// Status: [Development]
+//
+// [Since next]
+message LogRedactAction {
+  // The redact operations to execute in list order.
+  //
+  // [Since next]
+  repeated LogRedact redactions = 1;
 }
 
 // LogRedact masks a field value, or a part of a field value, on a log record.
@@ -267,6 +301,19 @@ message LogRedact {
   optional string regex = 3;
 }
 
+// LogRenameAction holds the ordered list of rename operations for a rename
+// policy. At least one operation MUST be specified.
+//
+// Status: [Development]
+//
+// [Since next]
+message LogRenameAction {
+  // The rename operations to execute in list order.
+  //
+  // [Since next]
+  repeated LogRename renamings = 1;
+}
+
 // LogRename moves an attribute or structured body field to a new key path on a
 // log record.
 //
@@ -291,6 +338,19 @@ message LogRename {
   //
   // [Since next]
   bool upsert = 3;
+}
+
+// LogAddAction holds the ordered list of add operations for an add policy.
+// At least one operation MUST be specified.
+//
+// Status: [Development]
+//
+// [Since next]
+message LogAddAction {
+  // The add operations to execute in list order.
+  //
+  // [Since next]
+  repeated LogAdd additions = 1;
 }
 
 // LogAdd inserts or overwrites one field or attribute on a log record.

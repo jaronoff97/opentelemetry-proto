@@ -409,32 +409,38 @@ When `body_field` is selected and `LogRecord.body` is not a `KeyValueList` map
 
 ## Log Transform Policy
 
-`LogTransformPolicy` modifies a log record that survives the filter stage.
+`LogTransformPolicy` modifies a log record that survives the filter stage. Each
+policy specifies one transformation action stage (`rename`, `add`, `remove`, or
+`redact`), which carries one or more operations of that stage.
 
 ```
 LogTransformPolicy {
   matches: LogMatcher[]  // OPTIONAL; if empty, matches all log records
-  rename:  LogRename[]   // OPTIONAL
-  add:     LogAdd[]      // OPTIONAL
-  remove:  LogRemove[]   // OPTIONAL
-  redact:  LogRedact[]   // OPTIONAL
+
+  // action (REQUIRED, exactly one of):
+  rename:  LogRenameAction { renamings:  LogRename[] }  // REQUIRED, at least one
+  add:     LogAddAction    { additions:  LogAdd[] }     // REQUIRED, at least one
+  remove:  LogRemoveAction { removals:   LogRemove[] }  // REQUIRED, at least one
+  redact:  LogRedactAction { redactions: LogRedact[] }  // REQUIRED, at least one
 }
 ```
 
-A policy MUST carry at least one operation.
+A policy with an unset `action`, or with an empty operation list in the selected
+action, is invalid.
 
 ### Execution Order
 
-A consumer MUST apply the operations in this order and MUST NOT reorder them:
+Across all matching `LogTransformPolicy` rules, a consumer MUST apply the
+operations in this stage order and MUST NOT reorder them:
 
 1. **Rename.** Change the field key.
 2. **Add.** Insert the field.
 3. **Remove.** Delete the field.
 4. **Redact.** Mask the field value.
 
-Within each of the four operation stages, operations across all matching
-`LogTransformPolicy` rules MUST execute in ascending lexicographical (UTF-8
-byte) order of `Policy.id`, and in list order within each policy.
+Within each of the four operation stages, matching `LogTransformPolicy` rules
+MUST execute in ascending lexicographical (UTF-8 byte) order of `Policy.id`,
+and the operations within each policy's action MUST execute in list order.
 
 ### Mutation Selectors
 
@@ -733,11 +739,11 @@ A span therefore has no keep-overrides-drop rule. A `percentage` of 100 states
 an intent to keep, but a policy with a lower percentage still wins, because a
 higher percentage has no sound claim over a lower one.
 
-**Transform stage.** Every matching transform policy contributes its operations.
-The operations run in the order `rename`, `add`, `remove`, `redact` across the
-union of all matching policies. Within each operation stage, operations across
-matching policies MUST execute in ascending lexicographical (UTF-8 byte) order
-of `Policy.id`, and in list order within each policy's operation list.
+**Transform stage.** Every matching transform policy contributes its stage's
+operations. Operations across all matching policies run in stage order:
+`rename`, `add`, `remove`, `redact`. Within each operation stage, matching
+policies MUST execute in ascending lexicographical (UTF-8 byte) order of
+`Policy.id`, and in list order within each policy's action.
 
 This rule set is commutative with respect to policy batch order: the outcome
 does not depend on the order in which policies arrive on the wire.
@@ -806,7 +812,7 @@ telemetry. A policy is invalid when any of these hold:
 | A filter policy has an unset action.                        | `action` absent                            |
 | A sampling policy has an unset `sampling` or `percentage`.  | `percentage` absent                        |
 | A sampling configuration is out of range.                   | `percentage: 150`, `sampling_precision: 0` |
-| A transform policy carries no operation.                    | no `rename`, `add`, `remove`, or `redact`  |
+| A transform policy has an unset `action` or an empty operation list. | an empty `action` oneof or `additions: []` |
 | A transform target or `rename` selector is unset.           | an empty `target`, `from`, or `to` oneof   |
 
 A consumer:
@@ -877,11 +883,12 @@ log_transform:
           path: ["http", "request", "headers", "authorization"]
       predicate: { exists: {} }
   redact:
-    - target:
-        log_attribute:
-          path: ["http", "request", "headers", "authorization"]
-      regex: '(?i)^(bearer\s+).+$'
-      replacement: "$1[REDACTED]"
+    redactions:
+      - target:
+          log_attribute:
+            path: ["http", "request", "headers", "authorization"]
+        regex: '(?i)^(bearer\s+).+$'
+        replacement: "$1[REDACTED]"
 ```
 
 **Prune healthy data points but keep the metric stream.**
@@ -945,7 +952,8 @@ A consumer conforms to this specification when it:
 3. Applies the [precedence](#precedence) rules across the filter, sampling, and
    transform stages.
 4. Runs the transform operations in the order `rename`, `add`, `remove`,
-   `redact`, ordered by ascending `Policy.id` within each operation stage.
+   `redact`, ordered by ascending `Policy.id` within each operation stage and in
+   list order within each policy's action.
 5. Stays fail-open for every error condition.
 6. Honors the `enabled` field.
 7. Validates a policy per the [compilation error](#compilation-errors) rules,
@@ -1020,13 +1028,22 @@ designs, together with what the decision costs.
 
 **Decision.** Each intent gets its own top-level message: `LogFilterPolicy`,
 `LogTransformPolicy`, `MetricFilterPolicy`, and `TraceSamplingPolicy`. A policy
-carries one matcher list and one action.
+carries one matcher list and one action (including `LogTransformPolicy`, which
+carries a `oneof action` over `rename`, `add`, `remove`, and `redact`, where
+each stage action wraps a list of operations of that same stage).
 
-**Tradeoff.** Four wire types instead of one per signal. A single record that
-needs both a filter rule and a transform rule now needs two policies, and the
-matcher list is duplicated between them. In exchange, each policy stays small,
-its validity is decidable on its own, and a new intent lands as a new type
-rather than as a new mode inside an existing one.
+**Tradeoff.** Four wire types instead of one per signal, and one policy per
+transform stage instead of bundling operations from multiple transform stages
+(`rename`, `add`, `remove`, `redact`) in a single policy. A single record that
+needs both a filter rule and a transform rule (or transform operations across
+multiple stages, such as renaming fields and adding static fields) now needs
+separate policies, and the matcher list is duplicated between them. In
+exchange, each policy stays scoped to a single stage (while still allowing
+multiple same-stage operations under one `matches` evaluation), its validity is
+decidable on its own, a single policy's operations are never split apart and
+interleaved with other policies across the global `rename`, `add`, `remove`,
+`redact` stages, and a new intent lands as a new type rather than as a new mode
+inside an existing one.
 
 ### The `Policy` envelope is mandatory
 
