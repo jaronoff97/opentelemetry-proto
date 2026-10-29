@@ -21,6 +21,9 @@
   - [Typed Values](#typed-values)
   - [Identifier Fields](#identifier-fields)
   - [Negation](#negation)
+- [Log Enablement Policy](#log-enablement-policy)
+  - [Log Enablement Granularity](#log-enablement-granularity)
+  - [Log Enablement Selectors](#log-enablement-selectors)
 - [Log Filter Policy](#log-filter-policy)
   - [Log Selectors](#log-selectors)
 - [Log Transform Policy](#log-transform-policy)
@@ -30,9 +33,14 @@
   - [Add](#add)
   - [Remove](#remove)
   - [Redact](#redact)
+- [Metric Enablement Policy](#metric-enablement-policy)
+  - [Metric Enablement Granularity](#metric-enablement-granularity)
+  - [Metric Enablement Selectors](#metric-enablement-selectors)
 - [Metric Filter Policy](#metric-filter-policy)
   - [Granularity](#granularity)
   - [Metric Selectors](#metric-selectors)
+- [Trace Enablement Policy](#trace-enablement-policy)
+  - [Trace Enablement Selectors](#trace-enablement-selectors)
 - [Trace Sampling Policy](#trace-sampling-policy)
   - [Trace Selectors](#trace-selectors)
   - [Span Events](#span-events)
@@ -98,14 +106,17 @@ policy is an independent unit. A policy MUST NOT reference another policy, and a
 policy MUST NOT depend on its position in a list. This independence lets a
 consumer evaluate a large policy set in parallel without coordination.
 
-This document defines four policy types:
+This document defines seven policy types:
 
-| Policy                | Signal  | Effect                                 |
-| --------------------- | ------- | -------------------------------------- |
-| `LogFilterPolicy`     | Logs    | Keeps or drops a log record.           |
-| `LogTransformPolicy`  | Logs    | Modifies a surviving log record.       |
-| `MetricFilterPolicy`  | Metrics | Keeps or drops a metric or data point. |
-| `TraceSamplingPolicy` | Traces  | Samples a span by probability.         |
+| Policy                   | Signal  | Effect                                                                      |
+| ------------------------ | ------- | --------------------------------------------------------------------------- |
+| `LogEnablementPolicy`    | Logs    | Enables log generation and opt-in attributes for matching scopes or events. |
+| `LogFilterPolicy`        | Logs    | Keeps or drops a log record.                                                |
+| `LogTransformPolicy`     | Logs    | Modifies a surviving log record.                                            |
+| `MetricEnablementPolicy` | Metrics | Enables metric generation and opt-in attributes for matching instruments.   |
+| `MetricFilterPolicy`     | Metrics | Keeps or drops a metric or data point.                                      |
+| `TraceEnablementPolicy`  | Traces  | Enables span generation and opt-in attributes for matching scopes.          |
+| `TraceSamplingPolicy`    | Traces  | Samples a span by probability.                                              |
 
 ## Design Principles
 
@@ -365,6 +376,52 @@ selector does not reveal.
 When `negate` is `true`, the consumer inverts the result of the predicate. A
 matcher that would match does not match, and the reverse.
 
+## Log Enablement Policy
+
+`LogEnablementPolicy` enables log record generation and opt-in log attributes
+for matching instrumentation scopes, severity levels, or events that are
+disabled by default.
+
+```
+LogEnablementPolicy {
+  matches:            LogEnablementMatcher[]  // REQUIRED, at least one
+  include_attributes: string[]                // OPTIONAL, attribute keys or globs
+}
+```
+
+When `include_attributes` is empty, matching log records use their default
+enabled attribute set. When `include_attributes` is non-empty, each entry is a
+case-sensitive attribute key or glob pattern (`*` matches zero or more
+characters; `?` matches any single character), and attributes matching any entry
+across matching enablement policies are enabled alongside the default enabled
+attribute set.
+
+### Log Enablement Granularity
+
+The matchers set the granularity:
+
+- **Scope level.** When every matcher selects `resource_attribute`,
+  `scope_attribute`, or `scope_field`, the matching instrumentation scope is
+  enabled.
+- **Record level.** When any matcher selects `record_field`, matching log
+  records (by severity number or event name) are enabled.
+
+### Log Enablement Selectors
+
+| Variant              | Type                       |
+| -------------------- | -------------------------- |
+| `record_field`       | `LogEnablementRecordField` |
+| `resource_attribute` | `AttributePath`            |
+| `scope_attribute`    | `AttributePath`            |
+| `scope_field`        | `ScopeField`               |
+
+`LogEnablementRecordField` values:
+
+| Value                                         | Read as                                                          |
+| --------------------------------------------- | ---------------------------------------------------------------- |
+| `LOG_ENABLEMENT_RECORD_FIELD_SEVERITY_NUMBER` | A number from 1 to 24. `regex` reads the canonical base-10 text. |
+| `LOG_ENABLEMENT_RECORD_FIELD_EVENT_NAME`      | The event name.                                                  |
+
 ## Log Filter Policy
 
 `LogFilterPolicy` keeps or drops a log record. A consumer evaluates each log
@@ -559,6 +616,45 @@ When `regex` is set, `replacement` is a template. A consumer MUST support:
 
 A reference to an absent capture group MUST expand to the empty string.
 
+## Metric Enablement Policy
+
+`MetricEnablementPolicy` enables metric telemetry generation and opt-in metric
+attributes for matching instrumentation scopes or metric instruments that are
+disabled by default.
+
+```
+MetricEnablementPolicy {
+  matches:            MetricEnablementMatcher[]  // REQUIRED, at least one
+  include_attributes: string[]                   // OPTIONAL, attribute keys or globs
+}
+```
+
+When `include_attributes` is empty, matching instruments use their default
+enabled attribute set (`Attributes` advisory parameter). When
+`include_attributes` is non-empty, each entry is a case-sensitive attribute key
+or glob pattern (`*` matches zero or more characters; `?` matches any single
+character), and attributes matching any entry across matching enablement
+policies are enabled alongside the default enabled attribute set.
+
+### Metric Enablement Granularity
+
+The matchers set the granularity:
+
+- **Scope level.** When every matcher selects `resource_attribute`,
+  `scope_attribute`, or `scope_field`, every metric instrument in the matching
+  instrumentation scope is enabled.
+- **Instrument level.** When any matcher selects `descriptor_field`, each
+  matching metric instrument is enabled on its own.
+
+### Metric Enablement Selectors
+
+| Variant              | Type                    |
+| -------------------- | ----------------------- |
+| `descriptor_field`   | `MetricDescriptorField` |
+| `resource_attribute` | `AttributePath`         |
+| `scope_attribute`    | `AttributePath`         |
+| `scope_field`        | `ScopeField`            |
+
 ## Metric Filter Policy
 
 `MetricFilterPolicy` keeps or drops a metric stream, or single data points of a
@@ -611,6 +707,33 @@ the prune leaves empty.
 | `METRIC_DESCRIPTOR_FIELD_TYPE`                    | `"GAUGE"`, `"SUM"`, `"HISTOGRAM"`, `"EXPONENTIAL_HISTOGRAM"`, or `"SUMMARY"`.           |
 | `METRIC_DESCRIPTOR_FIELD_AGGREGATION_TEMPORALITY` | `"DELTA"` or `"CUMULATIVE"`. A type that carries no temporality does not match.         |
 | `METRIC_DESCRIPTOR_FIELD_IS_MONOTONIC`            | A boolean. `regex` reads `"true"` or `"false"`. A type other than a Sum does not match. |
+
+## Trace Enablement Policy
+
+`TraceEnablementPolicy` enables span generation and opt-in span attributes for
+matching instrumentation scopes that are disabled by default.
+
+```
+TraceEnablementPolicy {
+  matches:            TraceEnablementMatcher[]  // REQUIRED, at least one
+  include_attributes: string[]                  // OPTIONAL, attribute keys or globs
+}
+```
+
+When `include_attributes` is empty, matching scopes use their default enabled
+attribute set. When `include_attributes` is non-empty, each entry is a
+case-sensitive attribute key or glob pattern (`*` matches zero or more
+characters; `?` matches any single character), and attributes matching any entry
+across matching enablement policies are enabled alongside the default enabled
+attribute set.
+
+### Trace Enablement Selectors
+
+| Variant              | Type            |
+| -------------------- | --------------- |
+| `resource_attribute` | `AttributePath` |
+| `scope_attribute`    | `AttributePath` |
+| `scope_field`        | `ScopeField`    |
 
 ## Trace Sampling Policy
 
@@ -707,11 +830,12 @@ so that several stages can sample one trace:
 ### Stages
 
 ```
-                 ┌────────┐   ┌────────┐   ┌───────────┐
-Telemetry ──────▶│ Filter │──▶│ Sample │──▶│ Transform │──▶ Out
-                 └────────┘   └────────┘   └───────────┘
-                  logs         traces        logs
-                  metrics
+            ┌────────────┐   ┌────────┐   ┌────────┐   ┌───────────┐
+Source ────▶│ Enablement │──▶│ Filter │──▶│ Sample │──▶│ Transform │──▶ Out
+            └────────────┘   └────────┘   └────────┘   └───────────┘
+             logs             logs         traces        logs
+             metrics          metrics
+             traces
 ```
 
 A consumer MAY evaluate policies concurrently within a stage. Policies are
@@ -721,8 +845,17 @@ Telemetry that a stage removes MUST NOT reach a later stage.
 
 ### Precedence
 
-**Default disposition.** Telemetry that no policy matches passes through
-unchanged.
+**Default disposition.** Telemetry, scopes, instruments, and attributes that no
+enablement policy matches retain their default enablement state, and emitted
+telemetry that no policy matches passes through unchanged.
+
+**Enablement stage.** This stage applies to logs, to metrics, and to traces.
+When any enablement policy for a signal matches an instrumentation scope, log
+severity or event, or metric instrument, the consumer enables that telemetry and
+the union of `include_attributes` across all matching enablement policies
+alongside its default enabled attribute set; otherwise it retains its default
+enablement state. Emitted telemetry from enabled scopes and instruments still
+enters the filter, sampling, and transform stages.
 
 **Filter stage.** This stage applies to logs and to metrics. Among the filter
 policies that match one record:
