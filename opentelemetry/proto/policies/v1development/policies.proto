@@ -89,6 +89,24 @@ message Policy {
     //
     // [Since next]
     TraceSamplingPolicy trace_sampling = 13;
+
+    // A policy that enables log generation and opt-in log attributes for
+    // matching instrumentation scopes, severity levels, or events.
+    //
+    // [Since next]
+    LogEnablementPolicy log_enablement = 14;
+
+    // A policy that enables metric generation and opt-in metric attributes for
+    // matching instrumentation scopes or metric instruments.
+    //
+    // [Since next]
+    MetricEnablementPolicy metric_enablement = 15;
+
+    // A policy that enables span generation and opt-in span attributes for
+    // matching instrumentation scopes.
+    //
+    // [Since next]
+    TraceEnablementPolicy trace_enablement = 16;
   }
 }
 

@@ -24,6 +24,9 @@
   * [Typed Values](#typed-values)
   * [Identifier Fields](#identifier-fields)
   * [Negation](#negation)
+- [Log Enablement Policy](#log-enablement-policy)
+  * [Log Enablement Granularity](#log-enablement-granularity)
+  * [Log Enablement Selectors](#log-enablement-selectors)
 - [Log Filter Policy](#log-filter-policy)
   * [Log Selectors](#log-selectors)
 - [Log Transform Policy](#log-transform-policy)
@@ -33,9 +36,14 @@
   * [Add](#add)
   * [Remove](#remove)
   * [Redact](#redact)
+- [Metric Enablement Policy](#metric-enablement-policy)
+  * [Metric Enablement Granularity](#metric-enablement-granularity)
+  * [Metric Enablement Selectors](#metric-enablement-selectors)
 - [Metric Filter Policy](#metric-filter-policy)
   * [Granularity](#granularity)
   * [Metric Selectors](#metric-selectors)
+- [Trace Enablement Policy](#trace-enablement-policy)
+  * [Trace Enablement Selectors](#trace-enablement-selectors)
 - [Trace Sampling Policy](#trace-sampling-policy)
   * [Trace Selectors](#trace-selectors)
   * [Span Events](#span-events)
@@ -52,11 +60,13 @@
 - [YAML Representation](#yaml-representation)
 - [Conformance](#conformance)
 - [Implementation Notes](#implementation-notes)
+  * [Pre-Creation Enablement and Disablement in SDKs](#pre-creation-enablement-and-disablement-in-sdks)
   * [Choosing a Regular Expression Engine](#choosing-a-regular-expression-engine)
   * [Identifier Comparison](#identifier-comparison)
 - [Design Decisions and Tradeoffs](#design-decisions-and-tradeoffs)
   * [One atomic policy type per intent](#one-atomic-policy-type-per-intent)
   * [The `Policy` envelope is mandatory](#the-policy-envelope-is-mandatory)
+  * [Separate additive enablement from filter and sampling](#separate-additive-enablement-from-filter-and-sampling)
   * [A typed action, not a polymorphic keep string](#a-typed-action-not-a-polymorphic-keep-string)
   * [Keep overrides drop, most restrictive within sampling](#keep-overrides-drop-most-restrictive-within-sampling)
   * [Traces carry sampling only](#traces-carry-sampling-only)
@@ -101,14 +111,17 @@ policy is an independent unit. A policy MUST NOT reference another policy, and a
 policy MUST NOT depend on its position in a list. This independence lets a
 consumer evaluate a large policy set in parallel without coordination.
 
-This document defines four policy types:
+This document defines seven policy types:
 
-| Policy                | Signal  | Effect                                 |
-| --------------------- | ------- | -------------------------------------- |
-| `LogFilterPolicy`     | Logs    | Keeps or drops a log record.           |
-| `LogTransformPolicy`  | Logs    | Modifies a surviving log record.       |
-| `MetricFilterPolicy`  | Metrics | Keeps or drops a metric or data point. |
-| `TraceSamplingPolicy` | Traces  | Samples a span by probability.         |
+| Policy                   | Signal  | Effect                                                                      |
+| ------------------------ | ------- | --------------------------------------------------------------------------- |
+| `LogEnablementPolicy`    | Logs    | Enables log generation and opt-in attributes for matching scopes or events. |
+| `LogFilterPolicy`        | Logs    | Keeps or drops a log record.                                                |
+| `LogTransformPolicy`     | Logs    | Modifies a surviving log record.                                            |
+| `MetricEnablementPolicy` | Metrics | Enables metric generation and opt-in attributes for matching instruments.   |
+| `MetricFilterPolicy`     | Metrics | Keeps or drops a metric or data point.                                      |
+| `TraceEnablementPolicy`  | Traces  | Enables span generation and opt-in attributes for matching scopes.          |
+| `TraceSamplingPolicy`    | Traces  | Samples a span by probability.                                              |
 
 ## Design Principles
 
@@ -142,7 +155,7 @@ identifier, lifecycle state, and operator metadata across all transports:
 | `definition`  | oneof         | -       | REQUIRED. Exactly one policy type.       |
 
 A consumer MUST treat a policy with `enabled` set to `false` as absent. Such a
-policy MUST NOT match, keep, drop, sample, or transform any telemetry.
+policy MUST NOT enable, match, keep, drop, sample, or transform any telemetry.
 
 `PolicySet` carries a complete set of policies. A consumer that receives a new
 `PolicySet` MUST replace its whole set.
@@ -152,9 +165,11 @@ policy MUST NOT match, keep, drop, sample, or transform any telemetry.
 Every policy type carries a `matches` list. A consumer combines the matchers
 with AND: every matcher MUST report true before the policy applies.
 
-A filter policy (`LogFilterPolicy`, `MetricFilterPolicy`) MUST carry at least
-one matcher; a consumer MUST reject a filter policy with an empty `matches`
-list so that a filter policy cannot drop or keep every record by accident. On
+An enablement policy (`LogEnablementPolicy`, `MetricEnablementPolicy`,
+`TraceEnablementPolicy`) or a filter policy (`LogFilterPolicy`,
+`MetricFilterPolicy`) MUST carry at least one matcher; a consumer MUST reject
+an enablement or filter policy with an empty `matches` list so that a policy
+cannot enable, drop, or keep every scope, instrument, or record by accident. On
 `LogTransformPolicy` and `TraceSamplingPolicy`, `matches` MAY be empty, in
 which case the policy matches every log record or span.
 
@@ -368,6 +383,52 @@ selector does not reveal.
 When `negate` is `true`, the consumer inverts the result of the predicate. A
 matcher that would match does not match, and the reverse.
 
+## Log Enablement Policy
+
+`LogEnablementPolicy` enables log record generation and opt-in log attributes
+for matching instrumentation scopes, severity levels, or events that are
+disabled by default.
+
+```
+LogEnablementPolicy {
+  matches:            LogEnablementMatcher[]  // REQUIRED, at least one
+  include_attributes: string[]                // OPTIONAL, attribute keys or globs
+}
+```
+
+When `include_attributes` is empty, matching log records use their default
+enabled attribute set. When `include_attributes` is non-empty, each entry is a
+case-sensitive attribute key or glob pattern (`*` matches zero or more
+characters; `?` matches any single character), and attributes matching any entry
+across matching enablement policies are enabled alongside the default enabled
+attribute set.
+
+### Log Enablement Granularity
+
+The matchers set the granularity:
+
+- **Scope level.** When every matcher selects `resource_attribute`,
+  `scope_attribute`, or `scope_field`, the matching instrumentation scope is
+  enabled.
+- **Record level.** When any matcher selects `record_field`, matching log
+  records (by severity number or event name) are enabled.
+
+### Log Enablement Selectors
+
+| Variant              | Type                       |
+| -------------------- | -------------------------- |
+| `record_field`       | `LogEnablementRecordField` |
+| `resource_attribute` | `AttributePath`            |
+| `scope_attribute`    | `AttributePath`            |
+| `scope_field`        | `ScopeField`               |
+
+`LogEnablementRecordField` values:
+
+| Value                                         | Read as                                                          |
+| --------------------------------------------- | ---------------------------------------------------------------- |
+| `LOG_ENABLEMENT_RECORD_FIELD_SEVERITY_NUMBER` | A number from 1 to 24. `regex` reads the canonical base-10 text. |
+| `LOG_ENABLEMENT_RECORD_FIELD_EVENT_NAME`      | The event name.                                                  |
+
 ## Log Filter Policy
 
 `LogFilterPolicy` keeps or drops a log record. A consumer evaluates each log
@@ -562,6 +623,45 @@ When `regex` is set, `replacement` is a template. A consumer MUST support:
 
 A reference to an absent capture group MUST expand to the empty string.
 
+## Metric Enablement Policy
+
+`MetricEnablementPolicy` enables metric telemetry generation and opt-in metric
+attributes for matching instrumentation scopes or metric instruments that are
+disabled by default.
+
+```
+MetricEnablementPolicy {
+  matches:            MetricEnablementMatcher[]  // REQUIRED, at least one
+  include_attributes: string[]                   // OPTIONAL, attribute keys or globs
+}
+```
+
+When `include_attributes` is empty, matching instruments use their default
+enabled attribute set (`Attributes` advisory parameter). When
+`include_attributes` is non-empty, each entry is a case-sensitive attribute key
+or glob pattern (`*` matches zero or more characters; `?` matches any single
+character), and attributes matching any entry across matching enablement
+policies are enabled alongside the default enabled attribute set.
+
+### Metric Enablement Granularity
+
+The matchers set the granularity:
+
+- **Scope level.** When every matcher selects `resource_attribute`,
+  `scope_attribute`, or `scope_field`, every metric instrument in the matching
+  instrumentation scope is enabled.
+- **Instrument level.** When any matcher selects `descriptor_field`, each
+  matching metric instrument is enabled on its own.
+
+### Metric Enablement Selectors
+
+| Variant              | Type                    |
+| -------------------- | ----------------------- |
+| `descriptor_field`   | `MetricDescriptorField` |
+| `resource_attribute` | `AttributePath`         |
+| `scope_attribute`    | `AttributePath`         |
+| `scope_field`        | `ScopeField`            |
+
 ## Metric Filter Policy
 
 `MetricFilterPolicy` keeps or drops a metric stream, or single data points of a
@@ -614,6 +714,33 @@ the prune leaves empty.
 | `METRIC_DESCRIPTOR_FIELD_TYPE`                    | `"GAUGE"`, `"SUM"`, `"HISTOGRAM"`, `"EXPONENTIAL_HISTOGRAM"`, or `"SUMMARY"`.           |
 | `METRIC_DESCRIPTOR_FIELD_AGGREGATION_TEMPORALITY` | `"DELTA"` or `"CUMULATIVE"`. A type that carries no temporality does not match.         |
 | `METRIC_DESCRIPTOR_FIELD_IS_MONOTONIC`            | A boolean. `regex` reads `"true"` or `"false"`. A type other than a Sum does not match. |
+
+## Trace Enablement Policy
+
+`TraceEnablementPolicy` enables span generation and opt-in span attributes for
+matching instrumentation scopes that are disabled by default.
+
+```
+TraceEnablementPolicy {
+  matches:            TraceEnablementMatcher[]  // REQUIRED, at least one
+  include_attributes: string[]                  // OPTIONAL, attribute keys or globs
+}
+```
+
+When `include_attributes` is empty, matching scopes use their default enabled
+attribute set. When `include_attributes` is non-empty, each entry is a
+case-sensitive attribute key or glob pattern (`*` matches zero or more
+characters; `?` matches any single character), and attributes matching any entry
+across matching enablement policies are enabled alongside the default enabled
+attribute set.
+
+### Trace Enablement Selectors
+
+| Variant              | Type            |
+| -------------------- | --------------- |
+| `resource_attribute` | `AttributePath` |
+| `scope_attribute`    | `AttributePath` |
+| `scope_field`        | `ScopeField`    |
 
 ## Trace Sampling Policy
 
@@ -710,11 +837,12 @@ so that several stages can sample one trace:
 ### Stages
 
 ```
-                 ┌────────┐   ┌────────┐   ┌───────────┐
-Telemetry ──────▶│ Filter │──▶│ Sample │──▶│ Transform │──▶ Out
-                 └────────┘   └────────┘   └───────────┘
-                  logs         traces        logs
-                  metrics
+            ┌────────────┐   ┌────────┐   ┌────────┐   ┌───────────┐
+Source ────▶│ Enablement │──▶│ Filter │──▶│ Sample │──▶│ Transform │──▶ Out
+            └────────────┘   └────────┘   └────────┘   └───────────┘
+             logs             logs         traces        logs
+             metrics          metrics
+             traces
 ```
 
 A consumer MAY evaluate policies concurrently within a stage. Policies are
@@ -724,8 +852,17 @@ Telemetry that a stage removes MUST NOT reach a later stage.
 
 ### Precedence
 
-**Default disposition.** Telemetry that no policy matches passes through
-unchanged.
+**Default disposition.** Telemetry, scopes, instruments, and attributes that no
+enablement policy matches retain their default enablement state, and emitted
+telemetry that no policy matches passes through unchanged.
+
+**Enablement stage.** This stage applies to logs, to metrics, and to traces.
+When any enablement policy for a signal matches an instrumentation scope, log
+severity or event, or metric instrument, the consumer enables that telemetry and
+the union of `include_attributes` across all matching enablement policies
+alongside its default enabled attribute set; otherwise it retains its default
+enablement state. Emitted telemetry from enabled scopes and instruments still
+enters the filter, sampling, and transform stages.
 
 **Filter stage.** This stage applies to logs and to metrics. Among the filter
 policies that match one record:
@@ -737,7 +874,17 @@ policies that match one record:
 
 `ACTION_KEEP` is therefore an exemption, not an allowlist: it retains the
 records it matches and does not prune the records it does not match. To build an
-allowlist, write `ACTION_DROP` with `negate: true` on the matchers.
+allowlist, write `ACTION_DROP` with `negate: true` on the matchers. When an
+`ACTION_DROP` policy matches an entire instrumentation scope (its matchers
+inspect only `resource_attribute`, `scope_attribute`, or `scope_field`) and no
+active `ACTION_KEEP` policy can match any record or data point from that scope,
+an SDK consumer SHOULD short-circuit scope-level pre-creation checks
+(`LoggerConfig.enabled = false` or `MeterConfig.enabled = false`). Similarly, an
+SDK consumer SHOULD short-circuit `Logger.Enabled(context, severity_number,
+event_name)` for record-level log drops and configure a Metrics `View` with
+`enabled = false` (`DropAggregation`, so `Instrument.Enabled()` returns `false`)
+for instrument-level metric drops (`descriptor_field`) when no `ACTION_KEEP`
+policy can match them.
 
 **Sampling stage.** This stage applies to traces. Among the sampling policies
 that match one span, the consumer applies the **most restrictive**
@@ -747,7 +894,12 @@ apply any one of them.
 
 A span therefore has no keep-overrides-drop rule. A `percentage` of 100 states
 an intent to keep, but a policy with a lower percentage still wins, because a
-higher percentage has no sound claim over a lower one.
+higher percentage has no sound claim over a lower one. When a sampling policy
+with `percentage` set to `0` matches an entire instrumentation scope (its
+matchers inspect only `resource_attribute`, `scope_attribute`, or `scope_field`),
+an SDK consumer SHOULD short-circuit `TracerConfig.enabled = false`
+(`Tracer.Enabled() == false`) so default-enabled trace instrumentations are
+disabled before span creation.
 
 **Transform stage.** Every matching transform policy contributes its operations.
 The operations run in the order `rename`, `add`, `remove`, `redact` across the
@@ -763,13 +915,17 @@ does not depend on the order in which policies arrive on the wire.
 When a consumer tracks policy evaluation and match outcomes for observability or
 diagnostics, it SHOULD track both:
 
-1. **Evaluated data (denominator)**: Every telemetry datum (one log record, one
-   metric data point, or one span) that enters policy evaluation for a signal,
-   before the filter, sampling, and transform stages run. A metric data point is
-   the unit for metrics, not a metric stream. This count includes data that are
-   subsequently dropped, sampled out, or transformed, as well as data that no
-   policy matches, providing the denominator needed to interpret per-policy
-   match counts.
+1. **Evaluated data (denominator)**: Every emitted post-creation telemetry datum
+   (one log record, one metric data point, or one span) that enters post-creation
+   policy evaluation for a signal, before the filter, sampling, and transform
+   stages run. A metric data point is the unit for metrics, not a metric stream.
+   This count includes data that are subsequently dropped, sampled out, or
+   transformed, as well as data that no policy matches, providing the
+   denominator needed to interpret per-policy match counts. (Pre-creation
+   `Enablement` evaluation operates on scopes, instruments, or pre-creation
+   checks before datum emission; when a consumer tracks enablement matches,
+   every matching enablement policy is a `hit` with no `miss` because enablement
+   is an additive union.)
 2. **Per-policy match outcomes**: For each policy that matches a telemetry
    datum, one of two outcomes under the [precedence](#precedence) rules above:
    - **`hit`**: The final decision for the stage honored the intent of the
@@ -812,7 +968,7 @@ telemetry. A policy is invalid when any of these hold:
 | ---------------------------------------------------------------- | -------------------------------------------------- |
 | The policy `id` is empty or duplicated within a batch.           | `id: ""`                                           |
 | The policy `definition` is unset.                                | an empty `definition` oneof                        |
-| A filter policy has an empty `matches` list.                     | `matches: []` on a filter policy                   |
+| An enablement or filter policy has an empty `matches` list.      | `matches: []` on an enablement or filter policy    |
 | A matcher sets no target.                                        | an empty `target` oneof                            |
 | A matcher sets no predicate.                                     | an empty `predicate` oneof                         |
 | A selector names an unspecified enum value.                      | `LOG_RECORD_FIELD_UNSPECIFIED`                     |
@@ -827,9 +983,9 @@ telemetry. A policy is invalid when any of these hold:
 
 A consumer:
 
-- MUST keep an invalid policy inert. The policy MUST NOT match, keep, drop,
-  sample, or transform any telemetry. A matcher that fails to compile MUST NOT
-  fall back to a permissive value.
+- MUST keep an invalid policy inert. The policy MUST NOT enable, match, keep,
+  drop, sample, or transform any telemetry. A matcher that fails to compile MUST
+  NOT fall back to a permissive value.
 - MUST NOT abort the compilation of the other policies in the same batch.
 - SHOULD collect every validation error for a policy rather than stop at the
   first, so that an operator can correct the whole policy in one pass.
@@ -951,6 +1107,33 @@ trace_sampling:
     mode: SAMPLING_MODE_EQUALIZING
 ```
 
+**Enable a default-disabled trace scope and opt-in request headers.**
+
+```yaml
+id: enable-http-spans-and-headers
+name: Enable HTTP trace scope and request headers
+trace_enablement:
+  matches:
+    - target: { scope_field: SCOPE_FIELD_NAME }
+      predicate: { equals: { string_value: io.opentelemetry.http } }
+  include_attributes:
+    - "http.request.header.x-request-id"
+    - "http.request.header.user-agent"
+```
+
+**Disable a default-enabled trace instrumentation scope.**
+
+```yaml
+id: disable-jdbc-spans
+name: Disable JDBC trace instrumentation
+trace_sampling:
+  matches:
+    - target: { scope_field: SCOPE_FIELD_NAME }
+      predicate: { equals: { string_value: io.opentelemetry.jdbc } }
+  sampling:
+    percentage: 0.0
+```
+
 ## Conformance
 
 A consumer conforms to this specification when it:
@@ -958,8 +1141,8 @@ A consumer conforms to this specification when it:
 1. Parses a valid policy as this document defines it.
 2. Evaluates a matcher with the specified target, predicate, and negation
    semantics.
-3. Applies the [precedence](#precedence) rules across the filter, sampling, and
-   transform stages.
+3. Applies the [precedence](#precedence) rules across the enablement, filter,
+   sampling, and transform stages.
 4. Runs the transform operations in the order `rename`, `add`, `remove`,
    `redact`, ordered by ascending `Policy.id` within each operation stage.
 5. Stays fail-open for every error condition.
@@ -975,6 +1158,51 @@ every policy type and every feature it does not support.
 
 This section is informative. It records guidance that the normative sections
 above imply but do not state, and it does not add a requirement.
+
+### Pre-Creation Enablement and Disablement in SDKs
+
+An OpenTelemetry SDK can evaluate enablement, filter, and sampling policies
+before constructing telemetry records by combining its configurator hooks
+(`TracerConfigurator`, `LoggerConfigurator`, `MeterConfigurator`), Metrics
+`Views`, `Enabled` checks, and `Sampler.ShouldSample`:
+
+- **Enabling default-disabled scopes and attributes (`<Signal>EnablementPolicy`).**
+  Scope-level matchers map to `TracerConfig.enabled = true`,
+  `LoggerConfig.enabled = true`, and `MeterConfig.enabled = true`. On logs,
+  `LogEnablementRecordField` (`SEVERITY_NUMBER`, `EVENT_NAME`) maps to the
+  parameters passed to `Logger.Enabled`. On metrics, `MetricDescriptorField` and
+  `include_attributes` map to a Metrics `View` with `enabled = true` and
+  `attribute_keys.included` set to the union of the instrument's default
+  `Attributes` advisory parameter and `include_attributes`. On traces,
+  `include_attributes` enables opt-in span attributes (such as
+  `http.request.header.*`) for matching instrumentation scopes. Collector
+  receivers can likewise use `MetricEnablementPolicy`, `LogEnablementPolicy`, and
+  `TraceEnablementPolicy` (including `include_attributes`) to turn on
+  disabled-by-default scrapers, metrics, and opt-in attributes.
+- **Disabling default-enabled scopes, instruments, and routes (`<Signal>FilterPolicy`
+  and `TraceSamplingPolicy`).** Turning telemetry off uses `LogFilterPolicy`
+  (`ACTION_DROP`), `MetricFilterPolicy` (`ACTION_DROP`), and
+  `TraceSamplingPolicy` (`percentage: 0.0`). When a drop or `0%` sampling policy
+  matches an entire instrumentation scope (its matchers inspect only
+  `resource_attribute`, `scope_attribute`, or `scope_field`) and—for logs and
+  metrics—no active `ACTION_KEEP` policy can match any record or data point from
+  that scope, the SDK can set `LoggerConfig.enabled = false`,
+  `MeterConfig.enabled = false`, or `TracerConfig.enabled = false` so
+  `Logger.Enabled()`, `Instrument.Enabled()`, and `Tracer.Enabled()` return
+  `false` on entry to the instrumentation. Record-level log drops (matching only
+  pre-creation `SEVERITY_NUMBER` or `EVENT_NAME` alongside scope/resource
+  targets, when no `ACTION_KEEP` policy can match) short-circuit
+  `Logger.Enabled(context, severity_number, event_name)` (or set
+  `LoggerConfig.minimum_severity`), and instrument-level metric drops (matching
+  `descriptor_field`, when no `ACTION_KEEP` policy can match) map to a Metrics
+  `View` with `enabled = false` (`DropAggregation`, so `Instrument.Enabled()`
+  returns `false`). Note that `Sampler.ShouldSample` in the OpenTelemetry Trace
+  SDK does not receive `InstrumentationScope`; an SDK therefore evaluates
+  scope-only `TraceSamplingPolicy` rules (`percentage: 0.0`) via
+  `TracerConfigurator` (`Tracer.Enabled`) and evaluates creation-time span rules
+  (such as dropping `url.path == "/heartbeat"` or `http.route == "/heartbeat"`
+  with `percentage: 0.0`) in `Sampler.ShouldSample` at span start
+  (`IsRecording() == false`).
 
 ### Choosing a Regular Expression Engine
 
@@ -1034,11 +1262,12 @@ designs, together with what the decision costs.
 
 ### One atomic policy type per intent
 
-**Decision.** Each intent gets its own top-level message: `LogFilterPolicy`,
-`LogTransformPolicy`, `MetricFilterPolicy`, and `TraceSamplingPolicy`. A policy
-carries one matcher list and one action.
+**Decision.** Each intent gets its own top-level message:
+`LogEnablementPolicy`, `LogFilterPolicy`, `LogTransformPolicy`,
+`MetricEnablementPolicy`, `MetricFilterPolicy`, `TraceEnablementPolicy`, and
+`TraceSamplingPolicy`. A policy carries one matcher list and one action.
 
-**Tradeoff.** Four wire types instead of one per signal. A single record that
+**Tradeoff.** Seven wire types instead of one per signal. A single record that
 needs both a filter rule and a transform rule now needs two policies, and the
 matcher list is duplicated between them. In exchange, each policy stays small,
 its validity is decidable on its own, and a new intent lands as a new type
@@ -1056,6 +1285,23 @@ resource identifier still carries `Policy.id` inside the payload. In exchange,
 consumers only ever decode one canonical envelope type, `enabled` is always
 available, and `Policy.id` is guaranteed to exist for deterministic transform
 ordering and observability.
+
+### Separate additive enablement from filter and sampling
+
+**Decision.** Turning default-disabled telemetry on uses
+`LogEnablementPolicy`, `MetricEnablementPolicy`, and `TraceEnablementPolicy` in
+an `Enablement` stage before `Filter`, whereas turning default-enabled telemetry
+off uses `LogFilterPolicy` (`ACTION_DROP`), `MetricFilterPolicy`
+(`ACTION_DROP`), and `TraceSamplingPolicy` (`percentage: 0.0`).
+
+**Tradeoff.** Enabling and disabling an instrumentation scope use two different
+policy stages rather than a single `ENABLE` / `DISABLE` enum on one policy type.
+In exchange, `Enablement` stays strictly additive (`union` across matching
+policies) and cannot conflict with `ACTION_KEEP` / `ACTION_DROP` precedence in
+`Filter` or lowest-percentage precedence in `Sample`. When a filter or sampling
+policy drops an entire scope or instrument and no `ACTION_KEEP` policy can match
+it, an SDK still short-circuits `Logger.Enabled`, `Instrument.Enabled`, or
+`Tracer.Enabled` before record creation.
 
 ### A typed action, not a polymorphic keep string
 
@@ -1087,27 +1333,31 @@ one.
 
 ### Traces carry sampling only
 
-**Decision.** Traces have one policy type, `TraceSamplingPolicy`. A `percentage`
-of 0 expresses a deterministic drop and a `percentage` of 100 expresses a
+**Decision.** For post-enablement retention and dropping, traces use
+`TraceSamplingPolicy` rather than a separate `TraceFilterPolicy` (while
+`TraceEnablementPolicy` handles pre-creation enablement). A `percentage` of 0
+expresses a deterministic drop and a `percentage` of 100 expresses a
 deterministic keep.
 
 **Tradeoff.** A span gets no exemption rule. A policy that states 100 percent
 still loses to a policy that states 5 percent, so an author cannot protect a
 span from a broad sampling rule the way `ACTION_KEEP` protects a log record. A
-separate deterministic span filter would restore that, at the cost of a second
-trace policy type and a second precedence rule for one signal. Sampling already
-covers both ends of the range, so the extra type earns nothing until a concrete
-need for the exemption appears. See [Deferred Features](#deferred-features).
+separate deterministic span filter would restore that, at the cost of another
+trace policy type and a second retention precedence rule for one signal.
+Sampling already covers both ends of the range, so the extra filter type earns
+nothing until a concrete need for the exemption appears. See
+[Deferred Features](#deferred-features).
 
 ### One shared predicate message
 
 **Decision.** `Predicate` is defined once in `common.proto` and reused by
-`LogMatcher`, `MetricMatcher`, and `TraceMatcher`.
+`LogEnablementMatcher`, `LogMatcher`, `MetricEnablementMatcher`,
+`MetricMatcher`, `TraceEnablementMatcher`, and `TraceMatcher`.
 
 **Tradeoff.** One extra level of message nesting on the wire, and one more
 allocation per matcher in a naive decoder. In exchange the eight predicate
-variants are defined once rather than three times, and they cannot drift apart
-as new signals arrive.
+variants are defined once rather than six times, and they cannot drift apart as
+new signals arrive.
 
 ### The target is a message, not an inline oneof
 

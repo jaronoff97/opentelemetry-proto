@@ -24,6 +24,101 @@ option java_package = "io.opentelemetry.proto.policies.v1development";
 option java_outer_classname = "PoliciesMetricsProto";
 option go_package = "go.opentelemetry.io/proto/otlp/policies/v1development";
 
+// MetricEnablementPolicy enables metric telemetry generation and opt-in metric
+// attributes for matching instrumentation scopes or metric instruments that are
+// disabled by default.
+//
+// The matchers set the granularity. When every matcher selects
+// resource_attribute, scope_attribute, or scope_field, every metric instrument
+// in the matching instrumentation scope is enabled. When any matcher selects
+// descriptor_field, each matching metric instrument is enabled on its own.
+//
+// An instrument that no enablement policy matches retains its default
+// enablement state.
+//
+// Status: [Development]
+//
+// [Since next]
+message MetricEnablementPolicy {
+  // Conditions that an instrumentation scope or a metric descriptor MUST
+  // satisfy to be enabled.
+  //
+  // A consumer combines the matchers with AND: every matcher MUST report true
+  // before the scope or instrument is enabled. A policy MUST carry at least
+  // one matcher.
+  //
+  // [Since next]
+  repeated MetricEnablementMatcher matches = 1;
+
+  // Optional attribute keys or glob patterns to enable on matching metric
+  // instruments.
+  //
+  // Each entry is a case-sensitive attribute key or glob pattern ('*' matches
+  // zero or more characters; '?' matches any single character). When empty,
+  // matching instruments use their default enabled attribute set. When
+  // non-empty, attributes matching any entry across matching enablement
+  // policies are enabled alongside the default enabled attribute set.
+  //
+  // [Since next]
+  repeated string include_attributes = 2;
+}
+
+// MetricEnablementMatcher evaluates one predicate against one pre-creation
+// metric scope or descriptor target.
+//
+// Status: [Development]
+//
+// [Since next]
+message MetricEnablementMatcher {
+  // The descriptor field, the attribute, or the scope metadata to inspect.
+  //
+  // [Since next]
+  MetricEnablementFieldSelector target = 1;
+
+  // How to compare the value that target selects.
+  //
+  // [Since next]
+  Predicate predicate = 2;
+
+  // Inverts the result of the predicate.
+  //
+  // [Since next]
+  bool negate = 3;
+}
+
+// MetricEnablementFieldSelector names one pre-creation metric scope or
+// descriptor target. Exactly one variant MUST be set.
+//
+// Status: [Development]
+//
+// [Since next]
+message MetricEnablementFieldSelector {
+  // The target. Exactly one variant MUST be set.
+  //
+  // [Since next]
+  oneof target {
+    // A descriptor field of the metric instrument.
+    //
+    // [Since next]
+    MetricDescriptorField descriptor_field = 1;
+
+    // A resource attribute, for example ["service.name"].
+    //
+    // [Since next]
+    AttributePath resource_attribute = 2;
+
+    // An instrumentation scope attribute.
+    //
+    // [Since next]
+    AttributePath scope_attribute = 3;
+
+    // A first-class field of the instrumentation scope.
+    //
+    // [Since next]
+    ScopeField scope_field = 4;
+  }
+}
+
 // MetricFilterPolicy keeps or drops a metric stream, or single data points of
 // a metric stream.
 //
