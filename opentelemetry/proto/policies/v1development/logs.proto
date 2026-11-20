@@ -26,9 +26,12 @@ option go_package = "go.opentelemetry.io/proto/otlp/policies/v1development";
 
 // LogFilterPolicy keeps or drops a log record.
 //
-// A consumer evaluates each log record on its own. A log record that no filter
-// policy matches passes through. When several filter policies match one log
-// record, ACTION_KEEP overrides ACTION_DROP.
+// A consumer evaluates each log record on its own in Pass 1 (before
+// LogTransformPolicy) and re-evaluates all LogFilterPolicy rules statelessly
+// in Pass 2 (after LogTransformPolicy) if any transform modified the record.
+// Within each pass, a log record that no filter policy matches passes through,
+// and when several filter policies match one log record, ACTION_KEEP overrides
+// ACTION_DROP.
 //
 // Status: [Development]
 //
@@ -51,7 +54,9 @@ message LogFilterPolicy {
   optional Action action = 2;
 }
 
-// LogTransformPolicy modifies a log record that survives the filter stage.
+// LogTransformPolicy modifies a log record that survives Pass 1 of the filter
+// stage. If any transform modifies the record, all LogFilterPolicy rules are
+// re-evaluated statelessly in Pass 2 against the post-transform record.
 //
 // A consumer applies the operations in one fixed order: rename, then add,
 // then remove, then redact. Within each operation stage, operations across

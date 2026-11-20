@@ -59,6 +59,7 @@
   * [The `Policy` envelope is mandatory](#the-policy-envelope-is-mandatory)
   * [A typed action, not a polymorphic keep string](#a-typed-action-not-a-polymorphic-keep-string)
   * [Keep overrides drop, most restrictive within sampling](#keep-overrides-drop-most-restrictive-within-sampling)
+  * [Two-pass stateless log filtering around transforms](#two-pass-stateless-log-filtering-around-transforms)
   * [Traces carry sampling only](#traces-carry-sampling-only)
   * [One shared predicate message](#one-shared-predicate-message)
   * [The target is a message, not an inline oneof](#the-target-is-a-message-not-an-inline-oneof)
@@ -103,12 +104,12 @@ consumer evaluate a large policy set in parallel without coordination.
 
 This document defines four standard policy types:
 
-| Policy               | Signal  | Effect                                 |
-| -------------------- | ------- | -------------------------------------- |
-| `LogFilterPolicy`    | Logs    | Keeps or drops a log record.           |
-| `LogTransformPolicy` | Logs    | Modifies a surviving log record.       |
-| `MetricFilterPolicy` | Metrics | Keeps or drops a metric or data point. |
-| `SpanSamplingPolicy` | Traces  | Samples a span by probability.         |
+| Policy               | Signal  | Effect                                  |
+| -------------------- | ------- | --------------------------------------- |
+| `LogFilterPolicy`    | Logs    | Keeps or drops a log record.            |
+| `LogTransformPolicy` | Logs    | Modifies a log record surviving Pass 1. |
+| `MetricFilterPolicy` | Metrics | Keeps or drops a metric or data point.  |
+| `SpanSamplingPolicy` | Traces  | Samples a span by probability.          |
 
 In addition, the `Policy` envelope includes a `custom_policy`
 (`google.protobuf.Any`) extension point so implementations and distributions can
@@ -401,7 +402,10 @@ matcher that would match does not match, and the reverse.
 ## Log Filter Policy
 
 `LogFilterPolicy` keeps or drops a log record. A consumer evaluates each log
-record on its own.
+record on its own before the transform stage (Pass 1), and re-evaluates all
+`LogFilterPolicy` rules statelessly after the transform stage (Pass 2) whenever
+any `LogTransformPolicy` modifies the record. See
+[Evaluation Model](#evaluation-model).
 
 ```
 LogFilterPolicy {
@@ -447,7 +451,9 @@ severity number, pair `exists` with `negate: true`.
 
 ## Log Transform Policy
 
-`LogTransformPolicy` modifies a log record that survives the filter stage.
+`LogTransformPolicy` modifies a log record that survives Pass 1 of the filter
+stage. If any transform modifies the record, all `LogFilterPolicy` rules are
+re-evaluated statelessly in Pass 2 against the post-transform record.
 
 ```
 LogTransformPolicy {
@@ -767,10 +773,10 @@ so that several stages can sample one trace:
 ### Stages
 
 ```
-                 ┌────────┐   ┌────────┐   ┌───────────┐
-Telemetry ──────▶│ Filter │──▶│ Sample │──▶│ Transform │──▶ Out
-                 └────────┘   └────────┘   └───────────┘
-                  logs         traces        logs
+                 ┌─────────────────┐   ┌────────┐   ┌───────────┐   ┌─────────────────┐
+Telemetry ──────▶│ Filter (Pass 1) │──▶│ Sample │──▶│ Transform │──▶│ Filter (Pass 2) │──▶ Out
+                 └─────────────────┘   └────────┘   └───────────┘   └─────────────────┘
+                  logs                  traces       logs            logs (if modified)
                   metrics
 ```
 
@@ -779,13 +785,27 @@ independent, so a stage needs no coordination.
 
 Telemetry that a stage removes MUST NOT reach a later stage.
 
+For logs, filtering runs in two passes around transforms:
+
+1. **Filter (Pass 1):** Evaluate all `LogFilterPolicy` rules against the
+   incoming log record. Records dropped in Pass 1 MUST NOT enter the Transform
+   stage.
+2. **Transform:** Evaluate and apply all matching `LogTransformPolicy` rules to
+   surviving log records.
+3. **Filter (Pass 2):** If any `LogTransformPolicy` modified the log record,
+   re-evaluate all `LogFilterPolicy` rules statelessly against the
+   post-transform log record. If no transform policy modified the record, the
+   consumer MAY skip Pass 2 because the post-transform record is identical to
+   the pre-transform record.
+
 ### Precedence
 
 **Default disposition.** Telemetry that no policy matches passes through
 unchanged.
 
-**Filter stage.** This stage applies to logs and to metrics. Among the filter
-policies that match one record:
+**Filter stage (Pass 1 and Pass 2).** This stage applies to logs and to metrics
+(Pass 2 applies to logs modified by `LogTransformPolicy`). Within each pass,
+among the filter policies that match one record:
 
 1. When any policy states `ACTION_KEEP`, the consumer keeps the record.
 2. Otherwise, when any policy states `ACTION_DROP`, the consumer drops the
@@ -795,6 +815,21 @@ policies that match one record:
 `ACTION_KEEP` is therefore an exemption, not an allowlist: it retains the
 records it matches and does not prune the records it does not match. To build an
 allowlist, write `ACTION_DROP` with `negate: true` on the matchers.
+
+For logs, Pass 2 MUST evaluate both `ACTION_KEEP` and `ACTION_DROP` statelessly
+against the post-transform record without carrying over a sticky keep decision
+from Pass 1:
+
+- If a transform adds, renames, removes, or modifies a field so that an
+  `ACTION_DROP` policy now matches (and no `ACTION_KEEP` policy matches the
+  post-transform record), the consumer drops the record in Pass 2.
+- If a record survived Pass 1 only because an `ACTION_KEEP` policy matched a
+  field that a transform subsequently overwrote, renamed, removed, or redacted
+  so that `ACTION_KEEP` no longer matches in Pass 2 while an `ACTION_DROP`
+  policy still matches, the consumer drops the record in Pass 2.
+
+Transforms run once per evaluation; Pass 2 only keeps or drops the
+post-transform record and never triggers another transform pass.
 
 **Sampling stage.** This stage applies to traces. Among the sampling policies
 that match one span, the consumer applies the **most restrictive**
@@ -834,17 +869,20 @@ diagnostics, it SHOULD track both:
    - **`miss`**: Another matching policy in the same stage overrode the intent
      of the policy.
 
-| Stage & Situation                                      | `hit`                            | `miss`                                |
-| ------------------------------------------------------ | -------------------------------- | ------------------------------------- |
-| Filter: keep and drop policies match; record is kept.  | Every matching keep policy.      | Every matching drop policy.           |
-| Filter: only keep policies match; record is kept.      | Every matching keep policy.      | None.                                 |
-| Filter: only drop policies match; record is dropped.   | Every matching drop policy.      | None.                                 |
-| Sampling: decision does not drop the span.             | Every matching sampling policy.  | None.                                 |
-| Sampling: decision drops the span.                     | The most restrictive policy.     | Every other matching sampling policy. |
-| Transform: record survives filter and policy matches.  | Every matching transform policy. | None.                                 |
+| Stage & Situation                                              | `hit`                            | `miss`                                |
+| -------------------------------------------------------------- | -------------------------------- | ------------------------------------- |
+| Filter: keep and drop policies match; record is kept.          | Every matching keep policy.      | Every matching drop policy.           |
+| Filter: only keep policies match; record is kept.              | Every matching keep policy.      | None.                                 |
+| Filter: only drop policies match; record is dropped.           | Every matching drop policy.      | None.                                 |
+| Sampling: decision does not drop the span.                     | Every matching sampling policy.  | None.                                 |
+| Sampling: decision drops the span.                             | The most restrictive policy.     | Every other matching sampling policy. |
+| Transform: record survives Filter (Pass 1) and policy matches. | Every matching transform policy. | None.                                 |
 
-A transform policy is not evaluated against a record that was dropped in the
-filter stage.
+A transform policy is not evaluated against a record that was dropped in Pass 1
+of the filter stage. When Pass 2 runs on a modified log record, the consumer
+SHOULD still count the log record only once in the evaluated-data denominator
+and report each `LogFilterPolicy`'s final Pass 2 outcome rather than
+double-counting the record across Pass 1 and Pass 2.
 
 How a consumer reports these counts and outcomes is outside the scope of this
 document.
@@ -1025,8 +1063,8 @@ A consumer conforms to this specification when it:
 1. Parses a valid policy as this document defines it.
 2. Evaluates a matcher with the specified target, predicate, and negation
    semantics.
-3. Applies the [precedence](#precedence) rules across the filter, sampling, and
-   transform stages.
+3. Applies the [precedence](#precedence) rules across the filter (Pass 1 and
+   stateless Pass 2 for modified logs), sampling, and transform stages.
 4. Runs the transform operations in the order `rename`, `add`, `remove`,
    `redact`, ordered by ascending `Policy.id` within each operation stage.
 5. Stays fail-open for every error condition.
@@ -1185,6 +1223,24 @@ an operator one clear way to protect critical telemetry, such as error logs,
 from a broad cost-control rule. Within sampling, "most restrictive" is the only
 sound rule, because a higher percentage has no meaningful claim over a lower
 one.
+
+### Two-pass stateless log filtering around transforms
+
+**Decision.** `LogFilterPolicy` runs before `LogTransformPolicy` (Pass 1) and
+re-runs statelessly against the post-transform log record (Pass 2) whenever any
+transform modifies the record. Pass 2 evaluates both `ACTION_KEEP` and
+`ACTION_DROP` fresh without carrying sticky state from Pass 1.
+
+**Tradeoff.** A log record that a transform modifies pays for a second filter
+pass, and an author pairing a broad `ACTION_DROP` rule with an `ACTION_KEEP`
+exemption must ensure transforms do not remove or overwrite the fields that the
+keep rule matches. In exchange, a single pre-transform filter pass cannot drop
+or exempt records based on attributes added, renamed, or normalized by
+transforms, while running transforms before filtering wastes transform work on
+records that pre-transform filters would drop immediately. Re-evaluating Pass 2
+statelessly also preserves multi-hop consistency: an SDK and a downstream
+Collector enforcing the same `PolicySet` reach the exact same disposition on the
+post-transform record.
 
 ### Traces carry sampling only
 
