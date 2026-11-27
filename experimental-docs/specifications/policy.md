@@ -50,6 +50,24 @@
   * [Compilation Errors](#compilation-errors)
   * [Runtime Errors](#runtime-errors)
 - [YAML Representation](#yaml-representation)
+- [Policy Providers](#policy-providers)
+  * [Provider Model](#provider-model)
+  * [Provider Priority](#provider-priority)
+  * [Policy Overlay](#policy-overlay)
+  * [Policy Capabilities](#policy-capabilities)
+  * [OpAMP Provider](#opamp-provider)
+    + [Capability Negotiation](#capability-negotiation)
+    + [Policy Delivery](#policy-delivery)
+    + [Delivery Status](#delivery-status)
+    + [Identifying a Policy Client](#identifying-a-policy-client)
+  * [HTTP Provider](#http-provider)
+    + [Request](#request)
+    + [Response](#response)
+    + [Failures](#failures)
+  * [File Provider](#file-provider)
+    + [Format](#format)
+    + [Loading and Reloading](#loading-and-reloading)
+  * [Provider Configuration](#provider-configuration)
 - [Conformance](#conformance)
 - [Implementation Notes](#implementation-notes)
   * [Choosing a Regular Expression Engine](#choosing-a-regular-expression-engine)
@@ -75,7 +93,11 @@
   * [Log sampling and rate limiting are deferred](#log-sampling-and-rate-limiting-are-deferred)
   * [A transform inserts a typed value](#a-transform-inserts-a-typed-value)
   * [Immutable correlation IDs and compile-time transform target validation](#immutable-correlation-ids-and-compile-time-transform-target-validation)
-  * [The transport is out of scope](#the-transport-is-out-of-scope)
+  * [The schema is independent of its providers](#the-schema-is-independent-of-its-providers)
+  * [Providers reuse existing protocols](#providers-reuse-existing-protocols)
+  * [Providers override by whole policy, not by field](#providers-override-by-whole-policy-not-by-field)
+  * [Policies ride OpAMP remote configuration](#policies-ride-opamp-remote-configuration)
+  * [A policy client has its own OpAMP identity](#a-policy-client-has-its-own-opamp-identity)
 - [Deferred Features](#deferred-features)
 - [References](#references)
 
@@ -110,6 +132,9 @@ This document defines four standard policy types:
 | `LogTransformPolicy` | Logs    | Modifies a surviving log record.       |
 | `MetricFilterPolicy` | Metrics | Keeps or drops a metric or data point. |
 | `SpanSamplingPolicy` | Traces  | Samples a span by probability.         |
+
+A consumer receives policies from one or more
+[policy providers](#policy-providers): OpAMP, HTTP, and File.
 
 In addition, the `Policy` envelope includes a `custom_policy`
 (`google.protobuf.Any`) extension point so implementations and distributions can
@@ -1023,6 +1048,397 @@ span_sampling:
     mode: SAMPLING_MODE_EQUALIZING
 ```
 
+## Policy Providers
+
+A **policy provider** supplies a [`PolicySet`](#policy-structure) to a consumer.
+This section defines three standard providers, OpAMP, HTTP, and File, and the
+rules a consumer follows to combine the sets they supply. Every provider carries
+the same `PolicySet` message, so a policy behaves identically whatever provider
+supplied it.
+
+The providers reuse existing protocols. The OpAMP provider uses OpAMP remote
+configuration and custom capabilities, and the HTTP provider uses plain HTTP
+conditional requests. No provider defines a new Protobuf message.
+
+### Provider Model
+
+```
+ ┌──────────────┐  priority 1
+ │ OpAMP Server │─────────────┐
+ └──────────────┘             │
+ ┌──────────────┐  priority 2 │    ┌───────────┐    ┌─────────────────────┐
+ │ HTTP Server  │─────────────┼───▶│  Overlay  │───▶│ Effective PolicySet │──▶ Evaluation
+ └──────────────┘             │    │  (by id)  │    └─────────────────────┘
+ ┌──────────────┐  priority 3 │    └───────────┘
+ │ File         │─────────────┘
+ └──────────────┘
+```
+
+A consumer MAY configure zero or more provider instances. A consumer with no
+configured provider evaluates no policy, so its telemetry passes through
+unchanged.
+
+Each provider instance holds its own **snapshot**: the complete `PolicySet` it
+supplied most recently. Every standard provider delivers a complete set, and a
+consumer MUST replace the snapshot of a provider instance as a whole when that
+provider delivers a new set. No standard provider sends incremental changes.
+
+A consumer MUST distinguish an unavailable provider from an empty one:
+
+- When a provider is unreachable, or its delivery cannot be decoded as a
+  whole, the consumer MUST keep the last snapshot it applied from that
+  provider. A stale policy set is never fatal.
+- When a provider delivers a set with no policies, the consumer MUST replace
+  the snapshot with an empty set, which removes every policy from that
+  provider.
+
+When a consumer starts, every snapshot is empty until its provider delivers a
+set. A consumer SHOULD NOT block the startup of its telemetry pipeline on a
+provider. Telemetry that flows before a provider delivers its first set passes
+through unchanged, consistent with
+[fail-open](#validation-and-error-handling) behavior.
+
+### Provider Priority
+
+Each provider instance has a priority. A lower number is a higher priority:
+
+| Provider | Priority                                |
+| -------- | --------------------------------------- |
+| OpAMP    | 1                                       |
+| HTTP     | 2                                       |
+| File     | 3                                       |
+| Custom   | Assigned by configuration. Default `4`. |
+
+When a consumer has more than one instance with the same priority, the instance
+that appears first in the consumer's configuration has the higher priority.
+
+The precedence follows the distance of each provider from the operator. An OpAMP
+server manages the consumer live and can correct a mistake in seconds. An HTTP
+server is centrally managed but polled. A file is deployed with the consumer and
+changes only with a deployment.
+
+### Policy Overlay
+
+A consumer computes its **effective policy set** from the provider snapshots:
+
+1. Collect every policy from every snapshot, together with the priority of the
+   provider instance that supplied it.
+2. For each `Policy.id`, select the policy from the highest-priority provider
+   that supplied that `id`. The selected policy is part of the effective set.
+3. Every other policy with the same `id` is **overridden**. An overridden
+   policy MUST NOT match, keep, drop, sample, or transform any telemetry.
+
+The overlay replaces a whole policy. A consumer MUST NOT merge the fields of two
+policies that share an `id`.
+
+The overlay applies to every policy with a non-empty `id`, whatever its other
+contents:
+
+- A higher-priority policy with `enabled` set to `false` overrides a
+  lower-priority policy with the same `id`. An operator therefore disables a
+  policy that a file supplied by sending the same `id` with `enabled: false`
+  through OpAMP.
+- A higher-priority policy that fails
+  [validation](#compilation-errors) overrides a lower-priority policy
+  with the same `id`. The invalid policy is inert, so the effective set contains
+  no policy for that `id`. A consumer MUST NOT fall back to the lower-priority
+  policy.
+- A policy that cannot be decoded far enough to read its `id` takes part in no
+  overlay.
+
+A consumer SHOULD log each overridden policy, naming the provider that
+overrode it.
+
+A consumer MUST recompute the effective set when any snapshot changes, and MUST
+swap the effective set atomically. No datum may be evaluated against a mix of the
+old and the new set.
+
+The overlay happens before evaluation. The
+[evaluation model](#evaluation-model) then applies to the effective set
+unchanged; for example, transform operations still run in ascending order of
+`Policy.id`.
+
+### Policy Capabilities
+
+A consumer advertises the policy features it supports with **capability
+identifiers**:
+
+| Identifier                                       | Meaning                                                                 |
+| ------------------------------------------------ | ----------------------------------------------------------------------- |
+| `io.opentelemetry.policies/v1development`        | REQUIRED. The consumer accepts a `PolicySet` from this package version. |
+| `io.opentelemetry.policies.log_filter`           | The consumer supports `LogFilterPolicy`.                                |
+| `io.opentelemetry.policies.log_transform`        | The consumer supports `LogTransformPolicy`.                             |
+| `io.opentelemetry.policies.metric_filter`        | The consumer supports `MetricFilterPolicy`.                             |
+| `io.opentelemetry.policies.span_sampling`        | The consumer supports `SpanSamplingPolicy`.                             |
+| `io.opentelemetry.policies.predicate.regex`      | The consumer supports `Predicate.regex`.                                |
+| `io.opentelemetry.policies.log_redact.regex`     | The consumer supports `LogRedact.regex`.                                |
+| `io.opentelemetry.policies.custom_policy.<name>` | The consumer supports a `custom_policy` whose message name is `<name>`. |
+
+The name of each standard policy type identifier is the name of its field in the
+`Policy.definition` oneof. For a custom policy, `<name>` is the fully qualified
+Protobuf message name, which is the `type_url` of the `custom_policy` after its
+last `/`. For example, a consumer that supports
+`type.googleapis.com/com.example.policy.DumpToS3` advertises
+`io.opentelemetry.policies.custom_policy.com.example.policy.DumpToS3`.
+
+A consumer MUST advertise the base identifier and one identifier for each policy
+type and optional capability it supports. A provider SHOULD NOT send a consumer
+a policy that uses a feature the consumer did not advertise. A consumer MUST
+still validate every policy it receives, because capabilities are advisory, and
+the HTTP and File providers carry none.
+
+### OpAMP Provider
+
+An [OpAMP](https://github.com/open-telemetry/opamp-spec/blob/main/specification.md)
+server supplies policies through the OpAMP
+[remote configuration](https://github.com/open-telemetry/opamp-spec/blob/main/specification.md#configuration)
+mechanism, which already provides change detection, delivery status, and
+effective-configuration reporting.
+
+#### Capability Negotiation
+
+An OpAMP client that accepts policies:
+
+- MUST set the `AcceptsRemoteConfig` bit in `AgentToServer.capabilities`.
+- SHOULD set the `ReportsRemoteConfig` and `ReportsEffectiveConfig` bits.
+- MUST include every [capability identifier](#policy-capabilities) it supports in
+  `AgentToServer.custom_capabilities.capabilities`.
+
+A server that supplies policies MUST include
+`io.opentelemetry.policies/v1development` in
+`ServerToAgent.custom_capabilities.capabilities`. A server MUST NOT send policies
+to a client that did not advertise the base identifier.
+
+The [OpAMP custom capabilities](https://github.com/open-telemetry/opamp-spec/blob/main/specification.md#customcapabilities)
+rules state that a custom capability should name a capability that a
+`CustomMessage` uses. The policy identifiers carry no `CustomMessage`: they
+describe what the remote configuration may contain, so that a server can read a
+client's policy support without another message.
+
+#### Policy Delivery
+
+The server places the policy set in the
+[`AgentConfigMap`](https://github.com/open-telemetry/opamp-spec/blob/main/specification.md#configuration-objects)
+of `ServerToAgent.remote_config.config` under the reserved key
+**`io.opentelemetry.policies`**:
+
+| `AgentConfigObject` field | Value                                                                                  |
+| ------------------------- | -------------------------------------------------------------------------------------- |
+| `body`                    | A `PolicySet` encoded as `content_type` states.                                        |
+| `content_type`            | `application/x-protobuf` for binary Protobuf, or `application/json` for Protobuf JSON. |
+| `role`                    | Not used by this specification.                                                        |
+
+```
+ServerToAgent {
+  remote_config: AgentRemoteConfig {
+    config: AgentConfigMap {
+      config_map: {
+        "io.opentelemetry.policies": AgentConfigObject {
+          body: <PolicySet>
+          content_type: "application/x-protobuf"
+        }
+        // Other keys belong to the Agent type and are unaffected.
+      }
+    }
+    config_hash: <hash of the whole AgentConfigMap>
+  }
+}
+```
+
+A client MUST support `application/x-protobuf` and SHOULD support
+`application/json`. The JSON encoding follows the
+[OTLP JSON Protobuf encoding](../../docs/specification.md#json-protobuf-encoding)
+rules. A server MUST set `content_type`.
+
+`AgentRemoteConfig` always carries the complete configuration map, so:
+
+- When `ServerToAgent.remote_config` is absent, the OpAMP snapshot is unchanged.
+- When `ServerToAgent.remote_config` is present and the map contains the key, the
+  client MUST replace its OpAMP snapshot with the decoded `PolicySet`.
+- When `ServerToAgent.remote_config` is present and the map does not contain
+  the key, the client MUST replace its OpAMP snapshot with an empty set.
+
+A client MUST NOT merge the `io.opentelemetry.policies` object with any other
+key in the map, or with a local configuration file of the Agent. The Agent may
+merge its own configuration keys in any Agent type-specific way, but the policy
+set reaches the policy engine unchanged and joins other providers only through
+the [policy overlay](#policy-overlay).
+
+#### Delivery Status
+
+The client reports
+[`RemoteConfigStatus`](https://github.com/open-telemetry/opamp-spec/blob/main/specification.md#remoteconfigstatus-message)
+for the whole remote configuration:
+
+- `APPLIED` when the client decoded the policy set and swapped in the new
+  effective set, **even when individual policies are invalid**. An invalid
+  policy is inert by design, so it does not fail the configuration.
+- `FAILED` when the body cannot be decoded as a `PolicySet`, or its
+  `content_type` is not supported. `error_message` SHOULD explain why. The
+  client keeps its previous OpAMP snapshot.
+
+When the client sets `ReportsEffectiveConfig`, it SHOULD report the effective
+policy set, after the [overlay](#policy-overlay) of every provider, under the
+`io.opentelemetry.policies` key of `AgentToServer.effective_config.config_map`.
+The OpAMP server can then see the policies that HTTP and File providers
+contribute. A client MAY omit policies from other providers when an operator
+configures it to do so.
+
+Per-policy status reporting, such as the validation errors of one policy, is
+not defined by this document.
+
+#### Identifying a Policy Client
+
+A policy client is not always the Agent that OpAMP manages. A process can run an
+OpAMP client for Agent management and a second, separate OpAMP client that only
+receives policies, or a standalone process can receive policies on behalf of
+the telemetry it handles. Both clients would present the same `service.*`
+identifying attributes, and the server could not tell them apart.
+
+An OpAMP client that exists only to receive policies, and that does not manage
+the Agent's other configuration:
+
+- MUST include the attribute **`otel.policy.client`** with the boolean value
+  `true` in `AgentDescription.identifying_attributes`.
+- MUST otherwise follow the
+  [OpenTelemetry guidelines](https://github.com/open-telemetry/opamp-spec/blob/main/opentelemetry-guidelines.md)
+  for identifying attributes, including `service.name`, `service.namespace`, and
+  `service.instance.id` of the telemetry the client applies policies to.
+- MUST use its own `instance_uid`, distinct from any other OpAMP client in the
+  same process.
+- MUST ignore every key of `remote_config.config` other than
+  `io.opentelemetry.policies`.
+
+An OpAMP client that manages an Agent and also accepts policies, such as the
+OpAMP extension of a Collector, MUST NOT add `otel.policy.client`. Adding it
+would change the Agent's identity. That client advertises policy support through
+[capability negotiation](#capability-negotiation) alone.
+
+`otel.policy.client` does not appear in the Resource of the client's own
+telemetry, an intentional exception to the OpAMP guidance that identifying
+attributes also appear in that Resource. The attribute distinguishes the
+connection, not the telemetry.
+
+A server MAY use `otel.policy.client` to present policy clients apart from the
+Agents they serve, and SHOULD NOT offer a policy client any configuration other
+than policies.
+
+### HTTP Provider
+
+An HTTP provider serves a `PolicySet` as an HTTP resource. A consumer polls the
+resource with conditional requests, so a static file server, an object store, or
+a CDN can act as a provider.
+
+#### Request
+
+The consumer sends an HTTP `GET` request to the configured URL.
+
+- The consumer MUST send an `Accept` header that lists the encodings it
+  supports: `application/x-protobuf`, `application/json`, or both.
+- When the consumer holds a snapshot from this provider, it SHOULD send the
+  `ETag` of that snapshot's response in an `If-None-Match` header.
+- The consumer MAY send `Accept-Encoding: gzip`.
+
+#### Response
+
+- `200 OK`: the body is a complete `PolicySet` in the encoding that the
+  `Content-Type` header states. The consumer MUST replace its HTTP snapshot
+  with it, even when it contains no policies. A server SHOULD send an `ETag`.
+- `304 Not Modified`: the set is unchanged. The consumer MUST keep its HTTP
+  snapshot.
+
+A consumer MUST support `application/x-protobuf` and SHOULD support
+`application/json`, with the same encoding rules as the
+[OTLP/HTTP](../../docs/specification.md#otlphttp) protocol.
+
+The consumer sends the next request after its configured poll interval. A
+default poll interval of 60 seconds is RECOMMENDED. When a response carries a
+`Cache-Control: max-age` directive, the consumer MAY wait that long instead, but
+MUST NOT poll more often than a minimum interval it enforces.
+
+#### Failures
+
+Any other response, and any connection error, leaves the HTTP snapshot
+unchanged. The consumer retries according to the
+[OTLP/HTTP retryable response codes](../../docs/specification.md#retryable-response-codes)
+and [throttling](../../docs/specification.md#otlphttp-throttling) rules,
+including `Retry-After`, with exponential backoff.
+
+A body that cannot be decoded as a `PolicySet` is a failure of the whole
+delivery and leaves the HTTP snapshot unchanged.
+
+### File Provider
+
+A file provider reads a `PolicySet` from a local file. Every read is a complete
+snapshot.
+
+#### Format
+
+The file contains one `PolicySet`, in one of these encodings:
+
+| Encoding        | Extension       | Requirement |
+| --------------- | --------------- | ----------- |
+| YAML            | `.yaml`, `.yml` | SHOULD      |
+| Protobuf JSON   | `.json`         | MUST        |
+| Binary Protobuf | `.binpb`        | MAY         |
+
+The consumer selects the encoding from the configuration, or otherwise from the
+file extension. YAML follows the
+[YAML representation](#yaml-representation):
+
+```yaml
+policies:
+  - id: drop-checkout-debug-logs
+    log_filter:
+      matches:
+        - target: { record_field: LOG_RECORD_FIELD_SEVERITY_TEXT }
+          predicate: { equals: { string_value: DEBUG } }
+      action: ACTION_DROP
+  - id: sample-database-spans
+    span_sampling:
+      matches:
+        - target: { span_attribute: { path: ["db.system.name"] } }
+          predicate: { exists: {} }
+      sampling: { percentage: 5.0 }
+```
+
+For YAML and JSON, a consumer SHOULD decode each element of `policies`
+separately, so that one malformed policy is skipped as a
+[parse error](#parse-errors) and does not discard the file.
+
+#### Loading and Reloading
+
+The consumer reads the file when it starts. When the file is missing or cannot be
+decoded at startup, the consumer MUST log an error and continue with an empty
+file snapshot.
+
+The consumer MAY watch the file and read it again when it changes. When a
+changed file cannot be read or decoded as a whole, the consumer MUST keep the
+previous file snapshot and SHOULD log an error. A consumer that watches a file
+SHOULD debounce change notifications, and a process that writes the file SHOULD
+replace it atomically, for example by renaming a temporary file.
+
+### Provider Configuration
+
+The configuration schema for providers belongs to
+[OpenTelemetry Declarative Configuration](https://opentelemetry.io/docs/specs/otel/configuration/data-model/)
+and is outside the scope of this document. This example is informative:
+
+```yaml
+policy:
+  providers:
+    - opamp: {} # Uses the process's OpAMP client configuration.
+    - http:
+        endpoint: https://policies.example.com/v1/policies
+        poll_interval: 60s
+    - file:
+        path: /etc/otel/policies.yaml
+        watch: true
+```
+
+The list order breaks ties only between instances of the same priority. It
+does not override the [provider priority](#provider-priority).
+
 ## Conformance
 
 A consumer conforms to this specification when it:
@@ -1039,6 +1455,9 @@ A consumer conforms to this specification when it:
 7. Validates a policy per the [compilation error](#compilation-errors) rules,
    keeps an invalid policy inert, and does not abort a valid policy in the same
    batch.
+8. Combines the sets of its configured [policy providers](#policy-providers)
+   with the [policy overlay](#policy-overlay), and follows the rules of each
+   standard provider it supports.
 
 A consumer MAY support a subset of the standard policy types defined in this
 document, and MAY also support additional custom or experimental policy types
@@ -1393,17 +1812,67 @@ transform policy, and statically impossible `LogAdd`/`LogRedact` configurations
 surface immediately as compilation errors instead of silently doing nothing at
 runtime.
 
-### The transport is out of scope
+### The schema is independent of its providers
 
-**Decision.** This document defines the policy schema and its evaluation
-semantics. It does not define how a consumer receives a policy set or how it
-reports the results.
+**Decision.** The policy schema and its evaluation semantics do not depend on
+how a consumer receives a policy set. [Policy providers](#policy-providers) are
+bindings on top of the schema: every provider carries the same `PolicySet`, and
+providers combine only through the id-based [overlay](#policy-overlay).
 
-**Tradeoff.** A conformant consumer still needs a transport binding. Binding the
-schema to one transport, whether xDS, OpAMP, or a dedicated sync protocol, would
-have blocked the others. The schema is transport-agnostic, so each binding can
-land on its own.
-<!-- TODO: Link to the policy specification in opentelemetry-specification once it exists. -->
+**Tradeoff.** Binding the schema to one transport, whether xDS, OpAMP, or a
+dedicated sync protocol, would have blocked the others. Keeping the bindings
+separate means a new provider can land without a schema change.
+
+### Providers reuse existing protocols
+
+**Decision.** The OpAMP provider uses OpAMP remote configuration and custom
+capabilities, and the HTTP provider uses HTTP conditional requests. This
+document defines no provider-specific Protobuf messages.
+
+**Tradeoff.** A dedicated sync protocol could carry client identity,
+capabilities, and per-policy status in one exchange. OpAMP already carries
+identity, capabilities, delivery status, and effective state, so a second
+protocol would duplicate it. The HTTP provider therefore stays a plain resource
+that any static server can host, and a consumer that needs a management
+channel uses OpAMP.
+
+### Providers override by whole policy, not by field
+
+**Decision.** When two providers supply the same `Policy.id`, the policy from
+the higher-priority provider replaces the other entirely, even when it is
+disabled or invalid.
+
+**Tradeoff.** A field-level merge would let an operator patch one field of a
+file policy from OpAMP, but it would create policies that no provider ever sent
+and that no operator reviewed. Falling back to the lower-priority policy when
+the higher-priority one is invalid would make the effective set depend on
+validation results in a way that is hard to predict. Whole-policy replacement
+keeps the effective set explainable: every effective policy is exactly one
+policy that one provider sent, and `enabled: false` is a reliable kill switch.
+
+### Policies ride OpAMP remote configuration
+
+**Decision.** The OpAMP provider carries the policy set as a reserved key of the
+remote configuration map.
+
+**Tradeoff.** A `CustomMessage` would keep policies apart from the Agent's
+configuration, but it would need its own hash, acknowledgement, and
+effective-state rules that remote configuration already provides. The cost is
+that an Agent whose configuration is also managed remotely receives its whole
+configuration map whenever a policy changes, and that a policy-only client must
+set `AcceptsRemoteConfig`.
+
+### A policy client has its own OpAMP identity
+
+**Decision.** A dedicated policy OpAMP client adds `otel.policy.client` to its
+identifying attributes.
+
+**Tradeoff.** The OpAMP guidelines expect identifying attributes to match the
+Resource of the Agent's own telemetry, and `otel.policy.client` does not. Without
+it, a policy client and an Agent management client in the same process present
+the same identity, and a server cannot tell them apart. A client that manages
+the Agent does not add the attribute, so adopting policies never changes an
+existing Agent's identity.
 
 ## Deferred Features
 
@@ -1425,7 +1894,10 @@ change to the types defined here.
 | Metric value thresholds      | A data point value target on `MetricFieldSelector`.                                             |
 | Boolean expression trees     | Out of scope. Write several policies for OR semantics.                                          |
 | Self-observability metrics   | Metric and attribute definitions in `semantic-conventions`.                                     |
-| Transport binding            | A separate document per transport.                                                              |
+| Per-policy provider status   | A status message for OpAMP and HTTP, after the OpAMP binding settles.                           |
+| HTTP capability negotiation  | Client metadata on the HTTP provider request.                                                   |
+| gRPC provider                | A gRPC service that returns a `PolicySet`.                                                      |
+| Incremental provider updates | An add/remove-by-id update, together with a full resync request.                                |
 | Policy provenance timestamps | Control plane metadata, outside the policy schema.                                              |
 
 ## References
@@ -1434,7 +1906,11 @@ change to the types defined here.
 - [OpenTelemetry Log Data Model](https://opentelemetry.io/docs/specs/otel/logs/data-model/)
 - [OpenTelemetry Probability Sampling](https://opentelemetry.io/docs/specs/otel/trace/tracestate-probability-sampling/)
 - [OpenTelemetry Tracestate Handling](https://opentelemetry.io/docs/specs/otel/trace/tracestate-handling/)
+- [OpAMP Specification](https://github.com/open-telemetry/opamp-spec/blob/main/specification.md)
+- [OpAMP OpenTelemetry Guidelines](https://github.com/open-telemetry/opamp-spec/blob/main/opentelemetry-guidelines.md)
+- [OpenTelemetry Declarative Configuration](https://opentelemetry.io/docs/specs/otel/configuration/data-model/)
 - [OTEP 4738: Telemetry Policy](https://github.com/open-telemetry/opentelemetry-specification/blob/main/oteps/4738-telemetry-policy.md)
 - [RE2 Regular Expression Syntax](https://github.com/google/re2/wiki/Syntax)
 - [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119)
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110)
 - [W3C Trace Context](https://www.w3.org/TR/trace-context/)
